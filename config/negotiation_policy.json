@@ -1,0 +1,22 @@
+{
+  "mode": "testing",
+
+  "testing_rfq_reminder_wait_minutes": 2,
+  "testing_rfq_deadline_minutes": 4,
+  "testing_max_rfq_reminders": 1,
+
+  "production_rfq_reminder_wait_hours": 24,
+  "production_rfq_deadline_hours": 120,
+  "production_max_rfq_reminders": 4,
+
+  "minimum_valid_offers": 2,
+  "allow_limited_competition_with_one_offer": true,
+
+  "target_discount_percent": 10,
+  "acceptance_tolerance_above_target_percent": 5,
+
+  "max_discount_requests_per_supplier": 1,
+  "max_negotiation_reminders_per_supplier": 3,
+
+  "pause_on_unknown_or_risky_topic": true
+}

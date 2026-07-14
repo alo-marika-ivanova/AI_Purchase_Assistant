@@ -1,0 +1,9 @@
+streamlit==1.41.1
+pandas==2.2.3
+python-dotenv
+msal
+requests
+streamlit-autorefresh
+fastapi
+uvicorn
+openpyxl==3.1.5
