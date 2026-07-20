@@ -1,0 +1,1538 @@
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' aip_current/AIPurchaseAssistant/app/db/repository.py milestone2_structured_analysis/app/db/repository.py
+--- aip_current/AIPurchaseAssistant/app/db/repository.py	2026-07-17 10:44:43.030826470 +0000
++++ milestone2_structured_analysis/app/db/repository.py	2026-07-17 11:09:24.926836685 +0000
+@@ -413,6 +413,7 @@
+         extraction_method: str,
+         extraction_confidence: str,
+         notes: str | None,
++        status: str = "active",
+     ) -> int:
+         total_price_usd = None
+         if quantity is not None and quantity > 0:
+@@ -425,9 +426,9 @@
+                 (
+                     case_id, supplier_id, message_id, unit_price_usd,
+                     quantity, total_price_usd, extraction_method,
+-                    extraction_confidence, notes
++                    extraction_confidence, status, notes
+                 )
+-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 """,
+                 (
+                     case_id,
+@@ -438,6 +439,7 @@
+                     total_price_usd,
+                     extraction_method,
+                     extraction_confidence,
++                    status,
+                     notes,
+                 ),
+             )
+@@ -449,7 +451,13 @@
+                 INSERT INTO negotiation_events (case_id, event_type, details)
+                 VALUES (?, 'offer_recorded', ?)
+                 """,
+-                (case_id, f"Offer recorded: supplier ID {supplier_id}, unit price USD {unit_price_usd}."),
++                (
++                    case_id,
++                    (
++                        f"Offer recorded: supplier ID {supplier_id}, "
++                        f"unit price USD {unit_price_usd}, status {status}."
++                    ),
++                ),
+             )
+ 
+             conn.execute(
+@@ -464,6 +472,64 @@
+ 
+         return offer_id
+ 
++    def get_latest_provisional_offer_for_case_supplier(
++        self,
++        case_id: int,
++        supplier_id: int,
++    ) -> dict | None:
++        with get_connection() as conn:
++            row = conn.execute(
++                """
++                SELECT
++                    o.id AS offer_id,
++                    o.case_id,
++                    o.supplier_id,
++                    o.message_id,
++                    o.unit_price_usd,
++                    o.extraction_method,
++                    o.extraction_confidence,
++                    o.status,
++                    o.notes,
++                    o.created_at
++                FROM offers o
++                WHERE o.case_id = ?
++                  AND o.supplier_id = ?
++                  AND o.status = 'provisional'
++                ORDER BY o.id DESC
++                LIMIT 1
++                """,
++                (case_id, supplier_id),
++            ).fetchone()
++
++        return dict(row) if row else None
++
++    def supersede_provisional_offers_for_case_supplier(
++        self,
++        case_id: int,
++        supplier_id: int,
++        reason: str,
++    ) -> int:
++        with get_connection() as conn:
++            cursor = conn.execute(
++                """
++                UPDATE offers
++                SET
++                    status = 'superseded',
++                    notes = CASE
++                        WHEN notes IS NULL OR TRIM(notes) = '' THEN ?
++                        ELSE notes || ' | ' || ?
++                    END
++                WHERE case_id = ?
++                  AND supplier_id = ?
++                  AND status = 'provisional'
++                """,
++                (reason, reason, case_id, supplier_id),
++            )
++            updated_count = int(cursor.rowcount)
++            conn.commit()
++
++        return updated_count
++
+     def list_offers_for_case(self, case_id: int) -> list[dict]:
+         with get_connection() as conn:
+             rows = conn.execute(
+@@ -2472,6 +2538,7 @@
+                 JOIN suppliers s ON s.id = o.supplier_id
+                 WHERE o.case_id = ?
+                   AND o.supplier_id = ?
++                  AND o.status = 'active'
+                 ORDER BY o.unit_price_usd ASC, o.id DESC
+                 LIMIT 1
+                 """,
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' aip_current/AIPurchaseAssistant/app/llm/communication_writer.py milestone2_structured_analysis/app/llm/communication_writer.py
+--- aip_current/AIPurchaseAssistant/app/llm/communication_writer.py	2026-07-08 17:20:39.000000000 +0000
++++ milestone2_structured_analysis/app/llm/communication_writer.py	2026-07-17 11:10:19.405974349 +0000
+@@ -236,6 +236,21 @@
+         body = templates[variant]
+         reason = "Supplier-specific fallback RFQ reminder."
+ 
++    elif intent == "acknowledge_tentative_price":
++        if supplier_best_price_usd is None:
++            raise ValueError(
++                "Provisional price is required for acknowledgment wording."
++            )
++
++        provisional_text = _format_usd_price(supplier_best_price_usd)
++        body = (
++            f"{opening} {supplier_name},\n\n"
++            f"Thank you for the update. Please confirm the USD "
++            f"{provisional_text} unit price once you have verified it "
++            f"internally.\n\nBest regards"
++        )
++        reason = "Fallback acknowledgment of provisional price."
++
+     elif intent == "clarify_price":
+         body = (
+             f"{opening} {supplier_name},\n\n"
+@@ -395,6 +410,8 @@
+ - Do not disclose competitor supplier names.
+ - Do not say an order is confirmed unless the intent is winner_notification.
+ - For negotiation, ask politely for improvement or target price.
++- For acknowledge_tentative_price, acknowledge the provisional amount, ask the
++  supplier to confirm it after internal verification, and do not call it final.
+ - For winner_notification, keep wording careful: selected/approved in the current negotiation context.
+ 
+ Intent:
+@@ -473,6 +490,19 @@
+                     "the explicit target price."
+                 )
+ 
++        if intent == "acknowledge_tentative_price":
++            if supplier_best_price_usd is None:
++                raise ValueError(
++                    "Provisional price is required for acknowledgment wording."
++                )
++            if not _message_mentions_target_price(
++                message=message,
++                target_price_usd=supplier_best_price_usd,
++            ):
++                raise ValueError(
++                    "LLM acknowledgment omitted the provisional price."
++                )
++
+         return {
+             "success": True,
+             "method": "ollama_communication_writer",
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' aip_current/AIPurchaseAssistant/app/llm/rfq_tentative_price_safeguard.py milestone2_structured_analysis/app/llm/rfq_tentative_price_safeguard.py
+--- aip_current/AIPurchaseAssistant/app/llm/rfq_tentative_price_safeguard.py	1970-01-01 00:00:00.000000000 +0000
++++ milestone2_structured_analysis/app/llm/rfq_tentative_price_safeguard.py	2026-07-17 11:08:13.706449505 +0000
+@@ -0,0 +1,195 @@
++from __future__ import annotations
++
++import re
++
++from app.llm.supplier_message_analysis import add_structured_dimensions
++from app.negotiation.common_reply_policy import extract_common_explicit_prices
++
++
++_TENTATIVE_PATTERN = re.compile(
++    r"\b(?:"
++    r"almost\s+sure|not\s+(?:yet\s+)?sure|I\s+think|I\s+believe|"
++    r"probably|likely|should\s+be|seems?\s+to\s+be|appears?\s+to\s+be|"
++    r"tentative(?:ly)?|not\s+final|"
++    r"(?:will|need\s+to|must|let\s+me)\s+(?:check|verify|confirm)|"
++    r"check\s+with|verify\s+with|confirm\s+with|ask\s+(?:my|our|the)\s+"
++    r"(?:supervisor|manager|boss|team)"
++    r")\b",
++    re.IGNORECASE,
++)
++
++_RISK_OR_SCOPE_PATTERN = re.compile(
++    r"\b(?:"
++    r"deposit|prepayment|pre-payment|payment\s+term|cash\s+payment|"
++    r"delivery|lead\s+time|ship(?:ping)?|"
++    r"different\s+(?:item|material|stone)|alternative\s+(?:item|material|stone)|"
++    r"specification|quality|certificate|return|refund|"
++    r"legal|liability|customs|sanction|compliance|"
++    r"confidential|exclusive|dispute|claim"
++    r")\b",
++    re.IGNORECASE,
++)
++
++_TOTAL_OR_TIER_PATTERN = re.compile(
++    r"\b(?:total|altogether|for\s+all|range|between|"
++    r"only\s+if|provided\s+that|subject\s+to|"
++    r"above|over|at\s+least|minimum|min\.?|more\s+than)\b",
++    re.IGNORECASE,
++)
++
++_CONFIRMATION_PATTERN = re.compile(
++    r"^(?:yes[,\s.!-]*)?(?:"
++    r"confirmed|I\s+confirm|we\s+confirm|that(?:'s|\s+is)\s+confirmed|"
++    r"the\s+price\s+is\s+confirmed|correct|yes\s+that(?:'s|\s+is)\s+correct"
++    r")[\s.!]*$",
++    re.IGNORECASE,
++)
++
++_WORD_PATTERN = re.compile(r"[a-zA-Z]+")
++_GENERIC_ITEM_WORDS = {
++    "diamond", "diamonds", "topaz", "sapphire", "sapphires", "ruby", "rubies",
++    "emerald", "emeralds", "gem", "gems", "gemstone", "gemstones", "stone", "stones",
++    "gold", "silver", "platinum", "pearl", "pearls",
++}
++
++
++def _requested_item_is_consistent(message_body: str, case_data: dict) -> bool:
++    """Reject obvious references to a different item in deterministic mode."""
++    item_words = {
++        word.lower()
++        for word in _WORD_PATTERN.findall(str(case_data.get("item_material") or ""))
++        if len(word) >= 3
++    }
++    message_words = {
++        word.lower()
++        for word in _WORD_PATTERN.findall(message_body)
++    }
++
++    mentioned_item_words = message_words & _GENERIC_ITEM_WORDS
++    requested_item_words = item_words & _GENERIC_ITEM_WORDS
++
++    if mentioned_item_words and requested_item_words:
++        return bool(mentioned_item_words & requested_item_words)
++
++    # When the supplier names an item, require at least one requested-item word.
++    if mentioned_item_words and not (message_words & item_words):
++        return False
++
++    return True
++
++
++def extract_tentative_rfq_unit_price(
++    message_body: str,
++    case_data: dict,
++) -> float | None:
++    """Extract one provisional unit price only when uncertainty is explicit."""
++    text = (message_body or "").strip()
++    if not text or "?" in text:
++        return None
++    if not _TENTATIVE_PATTERN.search(text):
++        return None
++    if _RISK_OR_SCOPE_PATTERN.search(text):
++        return None
++    if _TOTAL_OR_TIER_PATTERN.search(text):
++        return None
++    if not _requested_item_is_consistent(text, case_data):
++        return None
++
++    prices = extract_common_explicit_prices(text)
++    if len(prices) != 1:
++        return None
++
++    price = float(prices[0])
++    return price if price > 0 else None
++
++
++def is_contextual_provisional_price_confirmation(message_body: str) -> bool:
++    text = " ".join((message_body or "").strip().split())
++    return bool(text and _CONFIRMATION_PATTERN.fullmatch(text))
++
++
++def build_deterministic_tentative_rfq_result(price: float) -> dict:
++    return add_structured_dimensions(
++        {
++            "success": True,
++            "provider": "deterministic",
++            "model": None,
++            "message_category": "TENTATIVE_PRICE",
++            "recommended_action": "SAVE_PROVISIONAL_OFFER_AND_WAIT",
++            "safe_for_automation": True,
++            "requires_human_review": False,
++            "contains_risky_topic": False,
++            "risk_category": "NONE",
++            "confidence": "high",
++            "stated_price_amount": price,
++            "unit_price_usd": price,
++            "currency": "USD",
++            "price_basis": "UNIT",
++            "is_price_clear": True,
++            "is_currency_clear": True,
++            "has_multiple_prices": False,
++            "is_conditional": False,
++            "condition_summary": None,
++            "supplier_will_reply_later": True,
++            "supplier_refused": False,
++            "supplier_accepts_target": False,
++            "question_can_be_answered_from_case": False,
++            "price_certainty": "TENTATIVE",
++            "supplier_commitment": "WILL_VERIFY",
++            "pending_supplier_action": "Supplier will verify the indicated price.",
++            "offer_status": "PROVISIONAL",
++            "reason": (
++                "One USD unit price was stated, but the supplier explicitly "
++                "described it as unconfirmed and indicated that verification will follow."
++            ),
++            "suggested_clarification_question": None,
++            "suggested_buyer_reply": (
++                "Thank you for the update. Please confirm the price once you have "
++                "verified it internally."
++            ),
++            "raw_result": None,
++            "error": None,
++        }
++    )
++
++
++def build_contextual_price_confirmation_result(price: float) -> dict:
++    return add_structured_dimensions(
++        {
++            "success": True,
++            "provider": "deterministic_context",
++            "model": None,
++            "message_category": "CLEAR_PRICE_OFFER",
++            "recommended_action": "SAVE_OFFER",
++            "safe_for_automation": True,
++            "requires_human_review": False,
++            "contains_risky_topic": False,
++            "risk_category": "NONE",
++            "confidence": "high",
++            "stated_price_amount": price,
++            "unit_price_usd": price,
++            "currency": "USD",
++            "price_basis": "UNIT",
++            "is_price_clear": True,
++            "is_currency_clear": True,
++            "has_multiple_prices": False,
++            "is_conditional": False,
++            "condition_summary": None,
++            "supplier_will_reply_later": False,
++            "supplier_refused": False,
++            "supplier_accepts_target": False,
++            "question_can_be_answered_from_case": False,
++            "price_certainty": "CONFIRMED",
++            "supplier_commitment": "CONFIRMED",
++            "pending_supplier_action": None,
++            "offer_status": "CONFIRMED",
++            "reason": (
++                "The supplier explicitly confirmed the previously recorded "
++                "provisional unit price."
++            ),
++            "suggested_clarification_question": None,
++            "suggested_buyer_reply": None,
++            "raw_result": None,
++            "error": None,
++        }
++    )
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' aip_current/AIPurchaseAssistant/app/llm/supplier_message_analysis.py milestone2_structured_analysis/app/llm/supplier_message_analysis.py
+--- aip_current/AIPurchaseAssistant/app/llm/supplier_message_analysis.py	1970-01-01 00:00:00.000000000 +0000
++++ milestone2_structured_analysis/app/llm/supplier_message_analysis.py	2026-07-17 11:08:13.690643258 +0000
+@@ -0,0 +1,73 @@
++from __future__ import annotations
++
++from typing import Literal, TypedDict
++
++
++PriceCertainty = Literal["NONE", "TENTATIVE", "CONFIRMED"]
++SupplierCommitment = Literal["NONE", "WILL_VERIFY", "CONFIRMED"]
++OfferStatus = Literal["NONE", "PROVISIONAL", "CONFIRMED"]
++
++
++class StructuredSupplierMessageAnalysis(TypedDict, total=False):
++    """Stable semantic fields shared by LLM and deterministic analyzers.
++
++    The classifier may return many diagnostic fields, but these dimensions are
++    the business-facing contract consumed by the workflow policy.
++    """
++
++    price_certainty: PriceCertainty
++    supplier_commitment: SupplierCommitment
++    pending_supplier_action: str | None
++    offer_status: OfferStatus
++
++
++def add_structured_dimensions(result: dict) -> dict:
++    """Return a copy with normalized business-facing semantic dimensions."""
++    normalized = dict(result)
++
++    action = str(normalized.get("recommended_action") or "").upper()
++    category = str(normalized.get("message_category") or "").upper()
++
++    raw_certainty = str(normalized.get("price_certainty") or "").upper()
++    if raw_certainty not in {"NONE", "TENTATIVE", "CONFIRMED"}:
++        if action == "SAVE_PROVISIONAL_OFFER_AND_WAIT" or category == "TENTATIVE_PRICE":
++            raw_certainty = "TENTATIVE"
++        elif action == "SAVE_OFFER":
++            raw_certainty = "CONFIRMED"
++        else:
++            raw_certainty = "NONE"
++
++    raw_commitment = str(normalized.get("supplier_commitment") or "").upper()
++    if raw_commitment not in {"NONE", "WILL_VERIFY", "CONFIRMED"}:
++        if action == "SAVE_PROVISIONAL_OFFER_AND_WAIT" or category == "TENTATIVE_PRICE":
++            raw_commitment = "WILL_VERIFY"
++        elif action == "SAVE_OFFER":
++            raw_commitment = "CONFIRMED"
++        else:
++            raw_commitment = "NONE"
++
++    raw_offer_status = str(normalized.get("offer_status") or "").upper()
++    if raw_offer_status not in {"NONE", "PROVISIONAL", "CONFIRMED"}:
++        if action == "SAVE_PROVISIONAL_OFFER_AND_WAIT":
++            raw_offer_status = "PROVISIONAL"
++        elif action == "SAVE_OFFER":
++            raw_offer_status = "CONFIRMED"
++        else:
++            raw_offer_status = "NONE"
++
++    pending_action = normalized.get("pending_supplier_action")
++    if pending_action is not None:
++        pending_action = str(pending_action).strip() or None
++
++    if raw_commitment == "WILL_VERIFY" and not pending_action:
++        pending_action = "Supplier will verify and confirm the price."
++
++    normalized.update(
++        {
++            "price_certainty": raw_certainty,
++            "supplier_commitment": raw_commitment,
++            "pending_supplier_action": pending_action,
++            "offer_status": raw_offer_status,
++        }
++    )
++    return normalized
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' aip_current/AIPurchaseAssistant/app/llm/supplier_message_classifier.py milestone2_structured_analysis/app/llm/supplier_message_classifier.py
+--- aip_current/AIPurchaseAssistant/app/llm/supplier_message_classifier.py	2026-07-17 08:29:54.000000000 +0000
++++ milestone2_structured_analysis/app/llm/supplier_message_classifier.py	2026-07-17 11:09:02.281785998 +0000
+@@ -11,6 +11,13 @@
+     build_deterministic_rfq_offer_result,
+     extract_safe_simple_rfq_unit_price,
+ )
++from app.llm.rfq_tentative_price_safeguard import (
++    build_contextual_price_confirmation_result,
++    build_deterministic_tentative_rfq_result,
++    extract_tentative_rfq_unit_price,
++    is_contextual_provisional_price_confirmation,
++)
++from app.llm.supplier_message_analysis import add_structured_dimensions
+ 
+ 
+ load_dotenv()
+@@ -36,6 +43,7 @@
+ 
+ MESSAGE_CATEGORIES = {
+     "CLEAR_PRICE_OFFER",
++    "TENTATIVE_PRICE",
+     "IMPROVED_PRICE_OFFER",
+     "TARGET_ACCEPTANCE",
+     "UNCLEAR_PRICE",
+@@ -63,6 +71,7 @@
+ 
+ RECOMMENDED_ACTIONS = {
+     "SAVE_OFFER",
++    "SAVE_PROVISIONAL_OFFER_AND_WAIT",
+     "ASK_PRICE_CLARIFICATION",
+     "WAIT_FOR_SUPPLIER",
+     "ANSWER_FROM_CASE_AND_REPEAT_REQUEST",
+@@ -425,7 +434,10 @@
+         if price_basis == "UNKNOWN":
+             price_basis = "UNIT"
+ 
+-    supplier_will_reply_later = category == "ACKNOWLEDGEMENT_WILL_REPLY"
++    supplier_will_reply_later = category in {
++        "ACKNOWLEDGEMENT_WILL_REPLY",
++        "TENTATIVE_PRICE",
++    }
+     supplier_refused = category in {"DECLINES_OR_UNAVAILABLE", "PRICE_REFUSAL"}
+     supplier_accepts_target = category == "TARGET_ACCEPTANCE"
+     if category != "SUPPLIER_QUESTION":
+@@ -461,6 +473,13 @@
+         else:
+             action = "PAUSE_FOR_REVIEW"
+             requires_human_review = True
++    elif category == "TENTATIVE_PRICE":
++        action = (
++            "SAVE_PROVISIONAL_OFFER_AND_WAIT"
++            if valid_offer
++            else "ASK_PRICE_CLARIFICATION"
++        )
++        requires_human_review = False
+     elif category in CLARIFICATION_CATEGORIES:
+         action = "ASK_PRICE_CLARIFICATION"
+         requires_human_review = False
+@@ -470,7 +489,7 @@
+     else:
+         action = model_action
+ 
+-    if action == "SAVE_OFFER" and not valid_offer:
++    if action in {"SAVE_OFFER", "SAVE_PROVISIONAL_OFFER_AND_WAIT"} and not valid_offer:
+         action = "ASK_PRICE_CLARIFICATION"
+         requires_human_review = False
+ 
+@@ -489,6 +508,7 @@
+ 
+     safe_for_automation = action in {
+         "SAVE_OFFER",
++        "SAVE_PROVISIONAL_OFFER_AND_WAIT",
+         "ASK_PRICE_CLARIFICATION",
+         "WAIT_FOR_SUPPLIER",
+         "ANSWER_FROM_CASE_AND_REPEAT_REQUEST",
+@@ -499,7 +519,7 @@
+     if not reason:
+         reason = "The supplier message was interpreted by the local LLM."
+ 
+-    return {
++    return add_structured_dimensions({
+         "success": True,
+         "provider": "ollama",
+         "model": OLLAMA_MODEL,
+@@ -523,16 +543,20 @@
+         "supplier_refused": supplier_refused,
+         "supplier_accepts_target": supplier_accepts_target,
+         "question_can_be_answered_from_case": question_can_be_answered_from_case,
++        "price_certainty": parsed.get("price_certainty"),
++        "supplier_commitment": parsed.get("supplier_commitment"),
++        "pending_supplier_action": parsed.get("pending_supplier_action"),
++        "offer_status": parsed.get("offer_status"),
+         "reason": reason,
+         "suggested_clarification_question": clarification,
+         "suggested_buyer_reply": suggested_reply,
+         "raw_result": parsed,
+         "error": None,
+-    }
++    })
+ 
+ 
+ def _failure_result(error: str) -> dict:
+-    return {
++    return add_structured_dimensions({
+         "success": False,
+         "provider": "ollama",
+         "model": OLLAMA_MODEL,
+@@ -561,7 +585,7 @@
+         "suggested_buyer_reply": None,
+         "raw_result": None,
+         "error": error,
+-    }
++    })
+ 
+ 
+ def analyze_supplier_message_with_ollama(
+@@ -573,19 +597,38 @@
+     supplier_state: str | None = None,
+     target_price_usd: float | None = None,
+     supplier_best_price_usd: float | None = None,
++    provisional_price_usd: float | None = None,
+ ) -> dict:
+     clean_body = (message_body or "").strip()
+     if not clean_body:
+         return _failure_result("Supplier message is empty.")
+ 
+     if (conversation_stage or "").strip().upper() == "RFQ":
++        if (
++            provisional_price_usd is not None
++            and provisional_price_usd > 0
++            and is_contextual_provisional_price_confirmation(clean_body)
++        ):
++            return build_contextual_price_confirmation_result(
++                float(provisional_price_usd)
++            )
++
+         deterministic_price = extract_safe_simple_rfq_unit_price(
+             message_body=clean_body,
+             case_data=case_data,
+         )
+         if deterministic_price is not None:
+-            return build_deterministic_rfq_offer_result(
+-                deterministic_price
++            return add_structured_dimensions(
++                build_deterministic_rfq_offer_result(deterministic_price)
++            )
++
++        tentative_price = extract_tentative_rfq_unit_price(
++            message_body=clean_body,
++            case_data=case_data,
++        )
++        if tentative_price is not None:
++            return build_deterministic_tentative_rfq_result(
++                tentative_price
+             )
+ 
+     history_text = _format_recent_history(message_history)
+@@ -617,7 +660,11 @@
+   IMPROVED_PRICE_OFFER.
+ - "We cannot reduce", "our previous price is final", "no", or equivalent is
+   PRICE_REFUSAL.
+-- "We will check and reply tomorrow" is ACKNOWLEDGEMENT_WILL_REPLY.
++- "We will check and reply tomorrow" with no price is ACKNOWLEDGEMENT_WILL_REPLY.
++- If the supplier states one price but says it is uncertain or still needs internal
++  verification, use TENTATIVE_PRICE and SAVE_PROVISIONAL_OFFER_AND_WAIT.
++- A tentative price is useful information but is not a confirmed offer and must not
++  be used for ranking, target calculation, or winner selection.
+ - Do not confuse quoted earlier email text with the supplier's new intent.
+ RISK CLASSIFICATION HAS PRIORITY OVER PRICE CLASSIFICATION.
+ 
+@@ -692,6 +739,10 @@
+   "supplier_refused": true or false,
+   "supplier_accepts_target": true or false,
+   "question_can_be_answered_from_case": true or false,
++  "price_certainty": "NONE | TENTATIVE | CONFIRMED",
++  "supplier_commitment": "NONE | WILL_VERIFY | CONFIRMED",
++  "pending_supplier_action": "short text or null",
++  "offer_status": "NONE | PROVISIONAL | CONFIRMED",
+   "reason": "short precise explanation",
+   "suggested_clarification_question": "question or null",
+   "suggested_buyer_reply": "short draft or null"
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' aip_current/AIPurchaseAssistant/app/negotiation/rfq_rules.py milestone2_structured_analysis/app/negotiation/rfq_rules.py
+--- aip_current/AIPurchaseAssistant/app/negotiation/rfq_rules.py	2026-07-13 23:32:46.000000000 +0000
++++ milestone2_structured_analysis/app/negotiation/rfq_rules.py	2026-07-17 11:10:38.358697640 +0000
+@@ -114,6 +114,34 @@
+         # Do not send a price clarification immediately.
+         return None
+ 
++    if state_value == SupplierState.AWAITING_PRICE_CONFIRMATION.value:
++        provisional_offer = repo.get_latest_provisional_offer_for_case_supplier(
++            case_id=case_id,
++            supplier_id=supplier_id,
++        )
++        if provisional_offer is None:
++            return None
++
++        acknowledgement_count = repo.count_supplier_outbound_message_type(
++            case_id=case_id,
++            supplier_id=supplier_id,
++            message_type="provisional_price_acknowledgement",
++        )
++        if acknowledgement_count == 0:
++            return RfqRuleAction(
++                action_type="SEND_PROVISIONAL_PRICE_ACKNOWLEDGEMENT",
++                case_id=case_id,
++                supplier_id=supplier_id,
++                message_type="provisional_price_acknowledgement",
++                llm_intent="acknowledge_tentative_price",
++                reason=(
++                    "Supplier provided a tentative unit price and will verify it. "
++                    "Acknowledge the amount, request confirmation after internal "
++                    "verification, then wait without treating it as a valid offer."
++                ),
++            )
++        return None
++
+     if state_value == SupplierState.RESPONDED_NEEDS_EXTRACTION.value:
+         # The inbound supplier message is currently being interpreted.
+         # Another process may run the planner concurrently, so wait.
+@@ -359,6 +387,7 @@
+     - initial RFQ;
+     - RFQ reminders;
+     - clarification requests;
++    - provisional-price acknowledgements;
+     - supplier questions;
+     - no-response state;
+     - transition into multi-supplier negotiation.
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' aip_current/AIPurchaseAssistant/app/negotiation/states.py milestone2_structured_analysis/app/negotiation/states.py
+--- aip_current/AIPurchaseAssistant/app/negotiation/states.py	2026-07-08 17:20:39.000000000 +0000
++++ milestone2_structured_analysis/app/negotiation/states.py	2026-07-17 11:09:38.354713384 +0000
+@@ -24,6 +24,7 @@
+     REQUEST_SENT = "REQUEST_SENT"
+     AWAITING_RESPONSE = "AWAITING_RESPONSE"
+     WAITING_FOR_OFFER = "WAITING_FOR_OFFER"
++    AWAITING_PRICE_CONFIRMATION = "AWAITING_PRICE_CONFIRMATION"
+     NEEDS_CASE_ANSWER = "NEEDS_CASE_ANSWER"
+     RFQ_REMINDER_SENT = "RFQ_REMINDER_SENT"
+     RESPONDED_NEEDS_EXTRACTION = "RESPONDED_NEEDS_EXTRACTION"
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' aip_current/AIPurchaseAssistant/app/negotiation/supplier_message_policy.py milestone2_structured_analysis/app/negotiation/supplier_message_policy.py
+--- aip_current/AIPurchaseAssistant/app/negotiation/supplier_message_policy.py	1970-01-01 00:00:00.000000000 +0000
++++ milestone2_structured_analysis/app/negotiation/supplier_message_policy.py	2026-07-17 11:15:35.581988350 +0000
+@@ -0,0 +1,105 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++
++_ALLOWED_ACTIONS = {
++    "SAVE_OFFER",
++    "SAVE_PROVISIONAL_OFFER_AND_WAIT",
++    "ASK_PRICE_CLARIFICATION",
++    "WAIT_FOR_SUPPLIER",
++    "ANSWER_FROM_CASE_AND_REPEAT_REQUEST",
++    "MARK_REJECTED",
++    "RECORD_PRICE_REFUSAL",
++    "PAUSE_FOR_REVIEW",
++}
++
++
++@dataclass(frozen=True)
++class SupplierMessagePolicyDecision:
++    """Deterministic business decision based on structured interpretation."""
++
++    action: str
++    reason: str
++
++
++def _has_usable_unit_price(analysis: dict) -> bool:
++    try:
++        price = float(analysis.get("unit_price_usd"))
++    except (TypeError, ValueError):
++        return False
++
++    return (
++        price > 0
++        and str(analysis.get("currency") or "").upper() == "USD"
++        and str(analysis.get("price_basis") or "").upper() == "UNIT"
++        and bool(analysis.get("is_price_clear"))
++        and bool(analysis.get("is_currency_clear"))
++        and not bool(analysis.get("has_multiple_prices"))
++        and not bool(analysis.get("is_conditional"))
++    )
++
++
++def decide_supplier_message_policy(
++    analysis: dict,
++) -> SupplierMessagePolicyDecision:
++    """Convert semantic facts into an allowed workflow action.
++
++    The LLM or deterministic analyzer interprets language. This policy function
++    owns the business authority and therefore cannot be bypassed by an LLM's
++    recommended action.
++    """
++    if (
++        bool(analysis.get("requires_human_review"))
++        or bool(analysis.get("contains_risky_topic"))
++    ):
++        return SupplierMessagePolicyDecision(
++            action="PAUSE_FOR_REVIEW",
++            reason="Risk or explicit human-review requirement has priority.",
++        )
++
++    offer_status = str(analysis.get("offer_status") or "NONE").upper()
++    price_certainty = str(
++        analysis.get("price_certainty") or "NONE"
++    ).upper()
++    usable_price = _has_usable_unit_price(analysis)
++
++    if offer_status == "PROVISIONAL" or price_certainty == "TENTATIVE":
++        if usable_price:
++            return SupplierMessagePolicyDecision(
++                action="SAVE_PROVISIONAL_OFFER_AND_WAIT",
++                reason=(
++                    "A usable but explicitly tentative unit price may be stored "
++                    "as provisional and must remain excluded from comparison."
++                ),
++            )
++        return SupplierMessagePolicyDecision(
++            action="ASK_PRICE_CLARIFICATION",
++            reason="Tentative price information is not structurally usable.",
++        )
++
++    analyzer_action = str(
++        analysis.get("recommended_action") or ""
++    ).upper()
++
++    if analyzer_action == "SAVE_OFFER":
++        if usable_price:
++            return SupplierMessagePolicyDecision(
++                action="SAVE_OFFER",
++                reason="The analyzer returned a structurally valid confirmed offer.",
++            )
++        return SupplierMessagePolicyDecision(
++            action="ASK_PRICE_CLARIFICATION",
++            reason="A confirmed offer was suggested without a usable unit price.",
++        )
++
++    if analyzer_action in _ALLOWED_ACTIONS:
++        return SupplierMessagePolicyDecision(
++            action=analyzer_action,
++            reason="The analyzer action passed deterministic policy validation.",
++        )
++
++    return SupplierMessagePolicyDecision(
++        action="PAUSE_FOR_REVIEW",
++        reason="No safe workflow action could be determined.",
++    )
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' aip_current/AIPurchaseAssistant/app/services/offer_service.py milestone2_structured_analysis/app/services/offer_service.py
+--- aip_current/AIPurchaseAssistant/app/services/offer_service.py	2026-07-08 17:20:39.000000000 +0000
++++ milestone2_structured_analysis/app/services/offer_service.py	2026-07-17 11:11:01.191466920 +0000
+@@ -1,37 +1,39 @@
+-from __future__ import annotations
+-
+-from app.db.repository import PurchasingRepository
+-
+-
+-repo = PurchasingRepository()
+-
+-
+-def add_offer(
+-    case_id: int,
+-    supplier_id: int,
+-    unit_price_usd: float,
+-    quantity: float | None = None,
+-    message_id: int | None = None,
+-    extraction_method: str = "manual",
+-    extraction_confidence: str = "human_verified",
+-    notes: str | None = None,
+-) -> int:
+-    if unit_price_usd <= 0:
+-        raise ValueError("Unit price must be greater than zero.")
+-
+-    repo.ensure_supplier_linked_to_case(case_id, supplier_id)
+-
+-    return repo.add_offer(
+-        case_id=case_id,
+-        supplier_id=supplier_id,
+-        unit_price_usd=unit_price_usd,
+-        quantity=quantity,
+-        message_id=message_id,
+-        extraction_method=extraction_method,
+-        extraction_confidence=extraction_confidence,
+-        notes=notes,
+-    )
+-
+-
+-def list_offers_for_case(case_id: int) -> list[dict]:
++from __future__ import annotations
++
++from app.db.repository import PurchasingRepository
++
++
++repo = PurchasingRepository()
++
++
++def add_offer(
++    case_id: int,
++    supplier_id: int,
++    unit_price_usd: float,
++    quantity: float | None = None,
++    message_id: int | None = None,
++    extraction_method: str = "manual",
++    extraction_confidence: str = "human_verified",
++    notes: str | None = None,
++    status: str = "active",
++) -> int:
++    if unit_price_usd <= 0:
++        raise ValueError("Unit price must be greater than zero.")
++
++    repo.ensure_supplier_linked_to_case(case_id, supplier_id)
++
++    return repo.add_offer(
++        case_id=case_id,
++        supplier_id=supplier_id,
++        unit_price_usd=unit_price_usd,
++        quantity=quantity,
++        message_id=message_id,
++        extraction_method=extraction_method,
++        extraction_confidence=extraction_confidence,
++        notes=notes,
++        status=status,
++    )
++
++
++def list_offers_for_case(case_id: int) -> list[dict]:
+     return repo.list_offers_for_case(case_id)
+\ No newline at end of file
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' aip_current/AIPurchaseAssistant/app/services/simple_chat_service.py milestone2_structured_analysis/app/services/simple_chat_service.py
+--- aip_current/AIPurchaseAssistant/app/services/simple_chat_service.py	2026-07-17 08:29:54.000000000 +0000
++++ milestone2_structured_analysis/app/services/simple_chat_service.py	2026-07-17 11:15:37.570586508 +0000
+@@ -15,6 +15,9 @@
+ from app.negotiation.actions import NegotiationAction, NegotiationActionType
+ from app.negotiation.negotiation_rules import plan_initial_target_price_actions
+ from app.negotiation.states import CaseState, SupplierState
++from app.negotiation.supplier_message_policy import (
++    decide_supplier_message_policy,
++)
+ from app.negotiation.policy import load_negotiation_policy
+ from app.negotiation.comparison import prepare_case_for_negotiation
+ from app.llm.supplier_message_classifier import (
+@@ -457,6 +460,13 @@
+ 
+     supplier_text = _extract_supplier_authored_text(clean_body)
+ 
++    latest_provisional_offer = (
++        repo.get_latest_provisional_offer_for_case_supplier(
++            case_id=case_id,
++            supplier_id=supplier_id,
++        )
++    )
++
+     analysis = analyze_supplier_message_with_ollama(
+         message_body=supplier_text,
+         case_data=case_data,
+@@ -465,14 +475,30 @@
+         conversation_stage=conversation_stage,
+         supplier_state=supplier_state,
+         target_price_usd=None,
++        provisional_price_usd=(
++            float(latest_provisional_offer["unit_price_usd"])
++            if latest_provisional_offer is not None
++            else None
++        ),
+     )
+ 
+-    action = analysis["recommended_action"]
+-    extraction_method = (
+-        "deterministic_rfq_price_parser"
+-        if analysis.get("provider") == "deterministic"
+-        else "ollama_semantic_classifier"
+-    )
++    analyzer_recommended_action = analysis.get("recommended_action")
++    policy_decision = decide_supplier_message_policy(analysis)
++    analysis = {
++        **analysis,
++        "analyzer_recommended_action": analyzer_recommended_action,
++        "recommended_action": policy_decision.action,
++        "policy_action": policy_decision.action,
++        "policy_reason": policy_decision.reason,
++    }
++    action = policy_decision.action
++    provider = analysis.get("provider")
++    if provider == "deterministic":
++        extraction_method = "deterministic_rfq_price_parser"
++    elif provider == "deterministic_context":
++        extraction_method = "deterministic_context_confirmation"
++    else:
++        extraction_method = "ollama_semantic_classifier"
+ 
+     def pause_for_review(
+         review_type: str,
+@@ -523,6 +549,77 @@
+             "review_item_id": review_item_id,
+         }
+ 
++    if action == "SAVE_PROVISIONAL_OFFER_AND_WAIT":
++        unit_price_usd = analysis.get("unit_price_usd")
++
++        if unit_price_usd is None:
++            return pause_for_review(
++                review_type="invalid_provisional_offer_result",
++                reason=(
++                    "The analyzer identified a tentative price but did not "
++                    "return a usable unit price."
++                ),
++            )
++
++        repo.supersede_provisional_offers_for_case_supplier(
++            case_id=case_id,
++            supplier_id=supplier_id,
++            reason=(
++                "Superseded by a newer provisional price from the supplier."
++            ),
++        )
++
++        saved_offer_id = add_offer(
++            case_id=case_id,
++            supplier_id=supplier_id,
++            unit_price_usd=float(unit_price_usd),
++            quantity=None,
++            message_id=inbound_message_id,
++            extraction_method=extraction_method,
++            extraction_confidence=analysis.get("confidence", "low"),
++            notes=analysis.get("reason", ""),
++            status="provisional",
++        )
++
++        repo.set_supplier_state(
++            case_id=case_id,
++            supplier_id=supplier_id,
++            state=SupplierState.AWAITING_PRICE_CONFIRMATION.value,
++        )
++
++        repo.set_supplier_policy_state(
++            case_id=case_id,
++            supplier_id=supplier_id,
++            state=SupplierState.AWAITING_PRICE_CONFIRMATION.value,
++        )
++
++        repo.update_case_status_with_event(
++            case_id=case_id,
++            status=CaseState.COLLECTING_OFFERS.value,
++            event_type="provisional_supplier_price_recorded",
++            details=(
++                f"Supplier stated a provisional unit price of USD "
++                f"{float(unit_price_usd):.2f}. It is excluded from comparison "
++                "until confirmed."
++            ),
++        )
++
++        return {
++            "inbound_message_id": inbound_message_id,
++            "analysis": analysis,
++            "classification": analysis,
++            "extraction": {
++                "unit_price_usd": float(unit_price_usd),
++                "confidence": analysis.get("confidence", "low"),
++                "method": extraction_method,
++                "needs_review": False,
++                "offer_status": "provisional",
++                "reason": analysis.get("reason", ""),
++            },
++            "saved_offer_id": saved_offer_id,
++            "review_item_id": None,
++        }
++
+     if action == "SAVE_OFFER":
+         unit_price_usd = analysis.get("unit_price_usd")
+ 
+@@ -535,6 +632,15 @@
+                 ),
+             )
+ 
++        repo.supersede_provisional_offers_for_case_supplier(
++            case_id=case_id,
++            supplier_id=supplier_id,
++            reason=(
++                "Superseded because the supplier subsequently provided a "
++                "confirmed price."
++            ),
++        )
++
+         saved_offer_id = add_offer(
+             case_id=case_id,
+             supplier_id=supplier_id,
+@@ -596,6 +702,7 @@
+                 "confidence": analysis.get("confidence", "low"),
+                 "method": extraction_method,
+                 "needs_review": False,
++                "offer_status": "confirmed",
+                 "reason": analysis.get("reason", ""),
+             },
+             "saved_offer_id": saved_offer_id,
+@@ -866,6 +973,12 @@
+     for supplier in suppliers:
+         supplier_id = int(supplier["id"])
+         best_offer = repo.get_best_offer_for_case_supplier(case_id, supplier_id)
++        provisional_offer = (
++            repo.get_latest_provisional_offer_for_case_supplier(
++                case_id=case_id,
++                supplier_id=supplier_id,
++            )
++        )
+ 
+         rows.append(
+             {
+@@ -881,6 +994,16 @@
+                     best_offer["extraction_confidence"] if best_offer else None
+                 ),
+                 "offer_id": best_offer["offer_id"] if best_offer else None,
++                "provisional_unit_price_usd": (
++                    provisional_offer["unit_price_usd"]
++                    if provisional_offer
++                    else None
++                ),
++                "provisional_offer_id": (
++                    provisional_offer["offer_id"]
++                    if provisional_offer
++                    else None
++                ),
+             }
+         )
+ 
+@@ -1327,6 +1450,7 @@
+         raise ValueError("Supplier ID is required for supplier action.")
+ 
+     policy = load_negotiation_policy()
++    provisional_price_for_message: float | None = None
+ 
+     # ------------------------------------------------------------------
+     # Execution-level anti-duplicate and anti-spam guards.
+@@ -1518,6 +1642,78 @@
+ 
+         action_key = f"SEND_CLARIFICATION_REQUEST:{action.supplier_id}:1"
+ 
++    elif action.action_type == "SEND_PROVISIONAL_PRICE_ACKNOWLEDGEMENT":
++        state = repo.get_supplier_state(
++            case_id=action.case_id,
++            supplier_id=action.supplier_id,
++        )
++        state_value = (
++            state["state"]
++            if state
++            else SupplierState.NOT_CONTACTED.value
++        )
++        if state_value != SupplierState.AWAITING_PRICE_CONFIRMATION.value:
++            return {
++                "action": action.action_type,
++                "supplier_id": action.supplier_id,
++                "skipped": True,
++                "reason": (
++                    "Provisional-price acknowledgment skipped because the "
++                    "supplier is no longer awaiting price confirmation."
++                ),
++            }
++
++        provisional_offer = (
++            repo.get_latest_provisional_offer_for_case_supplier(
++                case_id=action.case_id,
++                supplier_id=action.supplier_id,
++            )
++        )
++        if provisional_offer is None:
++            return {
++                "action": action.action_type,
++                "supplier_id": action.supplier_id,
++                "skipped": True,
++                "reason": "No provisional offer is available to acknowledge.",
++            }
++
++        acknowledgement_count = repo.count_supplier_outbound_message_type(
++            case_id=action.case_id,
++            supplier_id=action.supplier_id,
++            message_type="provisional_price_acknowledgement",
++        )
++        if acknowledgement_count > 0:
++            return {
++                "action": action.action_type,
++                "supplier_id": action.supplier_id,
++                "skipped": True,
++                "reason": "Provisional price was already acknowledged.",
++            }
++
++        history_for_guard = repo.list_messages_for_case_supplier(
++            case_id=action.case_id,
++            supplier_id=action.supplier_id,
++        )
++        latest_message = history_for_guard[-1] if history_for_guard else None
++        if not latest_message or latest_message.get("direction") != "inbound":
++            return {
++                "action": action.action_type,
++                "supplier_id": action.supplier_id,
++                "skipped": True,
++                "reason": (
++                    "Provisional-price acknowledgment skipped because the "
++                    "latest message is not inbound."
++                ),
++            }
++
++        provisional_price_for_message = float(
++            provisional_offer["unit_price_usd"]
++        )
++        action_key = (
++            f"SEND_PROVISIONAL_PRICE_ACKNOWLEDGEMENT:"
++            f"{action.supplier_id}:{provisional_offer['offer_id']}"
++        )
++
+     elif action.action_type == "SEND_CASE_ANSWER":
+         state = repo.get_supplier_state(
+             case_id=action.case_id,
+@@ -1608,6 +1804,14 @@
+             "Ask for the best USD unit price. Do not confirm a purchase."
+         )
+ 
++    elif action.action_type == "SEND_PROVISIONAL_PRICE_ACKNOWLEDGEMENT":
++        extra_context = (
++            "The supplier stated a tentative unit price and said they still "
++            "need to verify it internally. Thank them, mention the provisional "
++            "amount exactly, ask them to confirm it after verification, and do "
++            "not describe it as accepted or final."
++        )
++
+     elif action.action_type == "SEND_CLARIFICATION_REQUEST":
+         extra_context = (
+             "Supplier replied but did not provide one clear usable USD unit price. "
+@@ -1631,6 +1835,7 @@
+         case_data=case_data,
+         supplier=supplier,
+         message_history=history,
++        supplier_best_price_usd=provisional_price_for_message,
+         extra_context=extra_context,
+     )
+ 
+@@ -1689,6 +1894,26 @@
+             state=SupplierState.RFQ_REMINDER_SENT.value,
+         )
+ 
++    elif action.action_type == "SEND_PROVISIONAL_PRICE_ACKNOWLEDGEMENT":
++        repo.set_supplier_state(
++            case_id=action.case_id,
++            supplier_id=action.supplier_id,
++            state=SupplierState.AWAITING_PRICE_CONFIRMATION.value,
++        )
++        repo.set_supplier_policy_state(
++            case_id=action.case_id,
++            supplier_id=action.supplier_id,
++            state=SupplierState.AWAITING_PRICE_CONFIRMATION.value,
++        )
++        repo.log_worker_event(
++            case_id=action.case_id,
++            event_type="provisional_price_acknowledged",
++            details=(
++                f"Acknowledged provisional price from supplier "
++                f"{supplier['name']} and requested confirmation."
++            ),
++        )
++
+     elif action.action_type == "SEND_CLARIFICATION_REQUEST":
+         repo.set_supplier_state(
+             case_id=action.case_id,
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' aip_current/AIPurchaseAssistant/tests/test_provisional_offer_workflow.py milestone2_structured_analysis/tests/test_provisional_offer_workflow.py
+--- aip_current/AIPurchaseAssistant/tests/test_provisional_offer_workflow.py	1970-01-01 00:00:00.000000000 +0000
++++ milestone2_structured_analysis/tests/test_provisional_offer_workflow.py	2026-07-17 11:16:01.317580177 +0000
+@@ -0,0 +1,257 @@
++from __future__ import annotations
++
++import pytest
++
++from app.db.database import get_connection
++from app.db.repository import PurchasingRepository
++from app.llm.rfq_tentative_price_safeguard import (
++    extract_tentative_rfq_unit_price,
++)
++from app.llm.supplier_message_classifier import (
++    analyze_supplier_message_with_ollama,
++)
++from app.negotiation.states import SupplierState
++from app.services.case_service import create_case
++from app.services.recommendation_service import get_offer_recommendation
++from app.services.simple_chat_service import (
++    build_supplier_overview,
++    continue_negotiation_for_case,
++    record_supplier_message_simple,
++    start_negotiating_case,
++)
++
++
++repo = PurchasingRepository()
++
++
++TENTATIVE_MESSAGE = (
++    "dear partner. Thank you for reaching and sorry for a delayed response. "
++    "I will check with my supervisor, but I am almost sure the topaz sky "
++    "costs 20 usd."
++)
++
++
++def _create_topaz_case(supplier_id: int) -> int:
++    return create_case(
++        item_material="Topaz Sky",
++        quantity=1.0,
++        notes="",
++        supplier_ids=[supplier_id],
++        auto_send_messages=False,
++    )
++
++
++def _offer_statuses(case_id: int, supplier_id: int) -> list[dict]:
++    with get_connection() as conn:
++        rows = conn.execute(
++            """
++            SELECT id, unit_price_usd, status
++            FROM offers
++            WHERE case_id = ?
++              AND supplier_id = ?
++            ORDER BY id
++            """,
++            (case_id, supplier_id),
++        ).fetchall()
++    return [dict(row) for row in rows]
++
++
++def test_tentative_price_is_structured_without_calling_llm() -> None:
++    analysis = analyze_supplier_message_with_ollama(
++        message_body=TENTATIVE_MESSAGE,
++        case_data={"item_material": "Topaz Sky", "quantity": 1.0},
++        conversation_stage="RFQ",
++        supplier_state=SupplierState.AWAITING_RESPONSE.value,
++    )
++
++    assert analysis["provider"] == "deterministic"
++    assert analysis["message_category"] == "TENTATIVE_PRICE"
++    assert analysis["recommended_action"] == (
++        "SAVE_PROVISIONAL_OFFER_AND_WAIT"
++    )
++    assert analysis["unit_price_usd"] == pytest.approx(20.0)
++    assert analysis["price_certainty"] == "TENTATIVE"
++    assert analysis["supplier_commitment"] == "WILL_VERIFY"
++    assert analysis["offer_status"] == "PROVISIONAL"
++    assert analysis["requires_human_review"] is False
++
++
++def test_tentative_price_is_saved_but_excluded_from_ranking(
++    supplier_ids: dict[str, int],
++) -> None:
++    supplier_id = supplier_ids["email"]
++    case_id = _create_topaz_case(supplier_id)
++    start_negotiating_case(case_id)
++
++    result = record_supplier_message_simple(
++        case_id=case_id,
++        supplier_id=supplier_id,
++        channel="manual",
++        body=TENTATIVE_MESSAGE,
++    )
++
++    state = repo.get_supplier_state(case_id, supplier_id)
++    provisional = repo.get_latest_provisional_offer_for_case_supplier(
++        case_id,
++        supplier_id,
++    )
++
++    assert result["saved_offer_id"] is not None
++    assert result["review_item_id"] is None
++    assert result["extraction"]["offer_status"] == "provisional"
++    assert state is not None
++    assert state["state"] == SupplierState.AWAITING_PRICE_CONFIRMATION.value
++    assert provisional is not None
++    assert float(provisional["unit_price_usd"]) == pytest.approx(20.0)
++
++    # Confirmed-offer queries, comparison and winner recommendation must ignore it.
++    assert repo.get_best_offer_for_case_supplier(case_id, supplier_id) is None
++    assert repo.list_offers_for_case(case_id) == []
++    assert get_offer_recommendation(case_id) is None
++
++    overview = build_supplier_overview(case_id)
++    assert overview[0]["best_unit_price_usd"] is None
++    assert overview[0]["provisional_unit_price_usd"] == pytest.approx(20.0)
++
++
++def test_provisional_price_is_acknowledged_once_and_then_waits(
++    supplier_ids: dict[str, int],
++) -> None:
++    supplier_id = supplier_ids["email"]
++    case_id = _create_topaz_case(supplier_id)
++    start_negotiating_case(case_id)
++
++    record_supplier_message_simple(
++        case_id=case_id,
++        supplier_id=supplier_id,
++        channel="manual",
++        body=TENTATIVE_MESSAGE,
++    )
++
++    first_cycle = continue_negotiation_for_case(case_id)
++    second_cycle = continue_negotiation_for_case(case_id)
++
++    assert [action["action"] for action in first_cycle["actions"]] == [
++        "SEND_PROVISIONAL_PRICE_ACKNOWLEDGEMENT"
++    ]
++    assert second_cycle["actions"] == []
++    assert repo.count_supplier_outbound_message_type(
++        case_id,
++        supplier_id,
++        "provisional_price_acknowledgement",
++    ) == 1
++
++    messages = repo.list_messages_for_case_supplier(case_id, supplier_id)
++    acknowledgement = [
++        message
++        for message in messages
++        if message.get("message_type") == "provisional_price_acknowledgement"
++    ][0]
++    normalized_body = acknowledgement["body"].lower()
++    assert "20" in normalized_body
++    assert "confirm" in normalized_body
++
++    state = repo.get_supplier_state(case_id, supplier_id)
++    assert state is not None
++    assert state["state"] == SupplierState.AWAITING_PRICE_CONFIRMATION.value
++
++
++def test_contextual_confirmation_creates_confirmed_offer(
++    supplier_ids: dict[str, int],
++) -> None:
++    supplier_id = supplier_ids["email"]
++    case_id = _create_topaz_case(supplier_id)
++    start_negotiating_case(case_id)
++
++    record_supplier_message_simple(
++        case_id=case_id,
++        supplier_id=supplier_id,
++        channel="manual",
++        body=TENTATIVE_MESSAGE,
++    )
++    continue_negotiation_for_case(case_id)
++
++    confirmation = record_supplier_message_simple(
++        case_id=case_id,
++        supplier_id=supplier_id,
++        channel="manual",
++        body="Confirmed.",
++    )
++
++    confirmed = repo.get_best_offer_for_case_supplier(case_id, supplier_id)
++    state = repo.get_supplier_state(case_id, supplier_id)
++    statuses = _offer_statuses(case_id, supplier_id)
++
++    assert confirmation["analysis"]["provider"] == "deterministic_context"
++    assert confirmation["extraction"]["offer_status"] == "confirmed"
++    assert confirmed is not None
++    assert float(confirmed["unit_price_usd"]) == pytest.approx(20.0)
++    assert state is not None
++    assert state["state"] == SupplierState.PRICE_EXTRACTED.value
++    assert [row["status"] for row in statuses] == ["superseded", "active"]
++
++
++def test_later_confirmed_price_supersedes_provisional_value(
++    supplier_ids: dict[str, int],
++) -> None:
++    supplier_id = supplier_ids["email"]
++    case_id = _create_topaz_case(supplier_id)
++    start_negotiating_case(case_id)
++
++    record_supplier_message_simple(
++        case_id=case_id,
++        supplier_id=supplier_id,
++        channel="manual",
++        body=TENTATIVE_MESSAGE,
++    )
++
++    confirmed_result = record_supplier_message_simple(
++        case_id=case_id,
++        supplier_id=supplier_id,
++        channel="manual",
++        body="22 usd is the unit price for 1pcs of topaz sky",
++    )
++
++    confirmed = repo.get_best_offer_for_case_supplier(case_id, supplier_id)
++    statuses = _offer_statuses(case_id, supplier_id)
++
++    assert confirmed_result["extraction"]["offer_status"] == "confirmed"
++    assert confirmed is not None
++    assert float(confirmed["unit_price_usd"]) == pytest.approx(22.0)
++    assert [row["status"] for row in statuses] == ["superseded", "active"]
++    assert [float(row["unit_price_usd"]) for row in statuses] == [20.0, 22.0]
++
++
++def test_risky_tentative_price_is_not_handled_deterministically() -> None:
++    price = extract_tentative_rfq_unit_price(
++        message_body=(
++            "I think the Topaz Sky price is 20 USD, but only with a 50% deposit."
++        ),
++        case_data={"item_material": "Topaz Sky", "quantity": 1.0},
++    )
++    assert price is None
++
++
++def test_policy_engine_overrides_unsafe_analyzer_recommendation() -> None:
++    from app.negotiation.supplier_message_policy import (
++        decide_supplier_message_policy,
++    )
++
++    decision = decide_supplier_message_policy(
++        {
++            "recommended_action": "SAVE_PROVISIONAL_OFFER_AND_WAIT",
++            "offer_status": "PROVISIONAL",
++            "price_certainty": "TENTATIVE",
++            "unit_price_usd": 20.0,
++            "currency": "USD",
++            "price_basis": "UNIT",
++            "is_price_clear": True,
++            "is_currency_clear": True,
++            "has_multiple_prices": False,
++            "is_conditional": False,
++            "contains_risky_topic": True,
++            "requires_human_review": True,
++        }
++    )
++
++    assert decision.action == "PAUSE_FOR_REVIEW"
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' aip_current/AIPurchaseAssistant/ui/streamlit_app_clean.py milestone2_structured_analysis/ui/streamlit_app_clean.py
+--- aip_current/AIPurchaseAssistant/ui/streamlit_app_clean.py	2026-07-15 21:21:51.000000000 +0000
++++ milestone2_structured_analysis/ui/streamlit_app_clean.py	2026-07-17 11:13:27.523228420 +0000
+@@ -606,11 +606,23 @@
+                 extraction = result["extraction"]
+ 
+                 if result["saved_offer_id"]:
+-                    st.success(
+-                        f"Supplier response recorded. "
+-                        f"Offer saved: USD {extraction['unit_price_usd']}. "
+-                        f"Created {len(negotiation_result['actions'])} automatic message(s)."
+-                    )
++                    offer_status = extraction.get("offer_status", "confirmed")
++
++                    if offer_status == "provisional":
++                        st.info(
++                            f"Supplier response recorded. Provisional price "
++                            f"stored: USD {extraction['unit_price_usd']}. "
++                            "It is excluded from comparison until confirmed. "
++                            f"Created {len(negotiation_result['actions'])} "
++                            "automatic message(s)."
++                        )
++                    else:
++                        st.success(
++                            f"Supplier response recorded. Confirmed offer "
++                            f"saved: USD {extraction['unit_price_usd']}. "
++                            f"Created {len(negotiation_result['actions'])} "
++                            "automatic message(s)."
++                        )
+                 else:
+                     st.info(
+                         "Supplier response recorded. "
+@@ -651,7 +663,17 @@
+                     ).get("state", "NOT_CONTACTED"),
+                     "Channel": row["channel"],
+                     "Email": row["email"],
+-                    "Best unit price USD": row["best_unit_price_usd"],
++                    "Best confirmed price USD": row["best_unit_price_usd"],
++                    "Provisional price USD": row["provisional_unit_price_usd"],
++                    "Offer status": (
++                        "Confirmed"
++                        if row["best_unit_price_usd"] is not None
++                        else (
++                            "Awaiting confirmation"
++                            if row["provisional_unit_price_usd"] is not None
++                            else "No price"
++                        )
++                    ),
+                     "Confidence": row["best_offer_confidence"],
+                 }
+                 for row in overview_rows
+@@ -707,7 +729,14 @@
+ 
+             with col2:
+                 if not supplier_has_offer:
+-                    st.caption("No confirmed offer")
++                    provisional_price = row.get("provisional_unit_price_usd")
++                    if provisional_price is not None:
++                        st.caption(
++                            f"Provisional USD {provisional_price}; "
++                            "awaiting confirmation"
++                        )
++                    else:
++                        st.caption("No confirmed offer")
+                 else:
+                     st.caption("Confirmed offer available")
+ 

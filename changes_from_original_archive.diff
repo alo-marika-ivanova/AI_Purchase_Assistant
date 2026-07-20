@@ -1,0 +1,81 @@
+--- /mnt/data/aipurchase_src/AIPurchaseAssistant/app/llm/supplier_message_classifier.py	2026-07-08 17:20:39.000000000 +0000
++++ /mnt/data/milestone1_step3_corrected_work/app/llm/supplier_message_classifier.py	2026-07-17 08:28:52.155606642 +0000
+@@ -7,6 +7,11 @@
+ 
+ from dotenv import load_dotenv
+ 
++from app.llm.rfq_price_safeguard import (
++    build_deterministic_rfq_offer_result,
++    extract_safe_simple_rfq_unit_price,
++)
++
+ 
+ load_dotenv()
+ 
+@@ -573,6 +578,16 @@
+     if not clean_body:
+         return _failure_result("Supplier message is empty.")
+ 
++    if (conversation_stage or "").strip().upper() == "RFQ":
++        deterministic_price = extract_safe_simple_rfq_unit_price(
++            message_body=clean_body,
++            case_data=case_data,
++        )
++        if deterministic_price is not None:
++            return build_deterministic_rfq_offer_result(
++                deterministic_price
++            )
++
+     history_text = _format_recent_history(message_history)
+ 
+     prompt = f"""
+--- /mnt/data/aipurchase_src/AIPurchaseAssistant/app/services/simple_chat_service.py	2026-07-15 23:11:52.000000000 +0000
++++ /mnt/data/milestone1_step3_corrected_work/app/services/simple_chat_service.py	2026-07-17 08:28:52.158760451 +0000
+@@ -468,6 +468,11 @@
+     )
+ 
+     action = analysis["recommended_action"]
++    extraction_method = (
++        "deterministic_rfq_price_parser"
++        if analysis.get("provider") == "deterministic"
++        else "ollama_semantic_classifier"
++    )
+ 
+     def pause_for_review(
+         review_type: str,
+@@ -510,7 +515,7 @@
+             "extraction": {
+                 "unit_price_usd": analysis.get("unit_price_usd"),
+                 "confidence": analysis.get("confidence", "low"),
+-                "method": "ollama_semantic_classifier",
++                "method": extraction_method,
+                 "needs_review": True,
+                 "reason": reason,
+             },
+@@ -536,7 +541,7 @@
+             unit_price_usd=float(unit_price_usd),
+             quantity=None,
+             message_id=inbound_message_id,
+-            extraction_method="ollama_semantic_classifier",
++            extraction_method=extraction_method,
+             extraction_confidence=analysis.get("confidence", "low"),
+             notes=analysis.get("reason", ""),
+         )
+@@ -589,7 +594,7 @@
+             "extraction": {
+                 "unit_price_usd": float(unit_price_usd),
+                 "confidence": analysis.get("confidence", "low"),
+-                "method": "ollama_semantic_classifier",
++                "method": extraction_method,
+                 "needs_review": False,
+                 "reason": analysis.get("reason", ""),
+             },
+@@ -643,7 +648,7 @@
+             "extraction": {
+                 "unit_price_usd": analysis.get("unit_price_usd"),
+                 "confidence": analysis.get("confidence", "low"),
+-                "method": "ollama_semantic_classifier",
++                "method": extraction_method,
+                 "needs_review": True,
+                 "reason": analysis.get("reason", ""),
+             },

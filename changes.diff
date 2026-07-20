@@ -1,0 +1,248 @@
+--- /mnt/data/current_ui_work/original/AIPurchaseAssistant/ui/streamlit_app_clean.py	2026-07-15 21:21:51.000000000 +0000
++++ /mnt/data/streamlit_hidden_case_form/streamlit_app_clean.py	2026-07-19 20:57:16.392859389 +0000
+@@ -39,12 +39,15 @@
+ 
+ 
+ repo = PurchasingRepository()
+-st.title("AI Purchase Assistant")
++
++
+ # ---------------------------------------------------------------------
+-# Case creation
++# Case creation dialog
+ # ---------------------------------------------------------------------
+ 
+-with st.expander("Create new case", expanded=False):
++@st.dialog("Create new negotiation case", width="large")
++def show_create_case_dialog() -> None:
++    """Render case creation only when the buyer explicitly opens it."""
+     material_choices = list_material_choices()
+ 
+     if not material_choices:
+@@ -52,102 +55,138 @@
+             "No supplier-material catalog is loaded yet. "
+             "Run scripts/import_supplier_filter_xlsx.py first."
+         )
+-    else:
+-        material_labels = {
+-            (
+-                f"{row['goods_group']} | {row['goods_name']} "
+-                f"({row['supplier_count']} supplier(s))"
+-            ): row
+-            for row in material_choices
+-        }
+-
+-        selected_material_label = st.selectbox(
+-            "Item/material",
+-            options=list(material_labels.keys()),
++        return
++
++    material_labels = {
++        (
++            f"{row['goods_group']} | {row['goods_name']} "
++            f"({row['supplier_count']} supplier(s))"
++        ): row
++        for row in material_choices
++    }
++
++    selected_material_label = st.selectbox(
++        "Item/material",
++        options=list(material_labels.keys()),
++        help=(
++            "Start typing to search. Only materials imported from the "
++            "buyer supplier filter database can be selected."
++        ),
++        key="new_case_material",
++    )
++
++    selected_material = material_labels[selected_material_label]
++    selected_goods_name = selected_material["goods_name"]
++    suppliers = list_suppliers_for_material(selected_goods_name)
++
++    if not suppliers:
++        st.warning(
++            "No active suppliers are linked to this material. "
++            "Choose another material or re-import the supplier workbook."
++        )
++        return
++
++    supplier_labels = {
++        (
++            f"{supplier['name']} | "
++            f"{supplier.get('contact_channel') or 'manual'} | "
++            f"{supplier.get('email') or supplier.get('whatsapp_number') or 'no contact'}"
++        ): supplier["id"]
++        for supplier in suppliers
++    }
++
++    default_supplier_labels = list(supplier_labels.keys())
++
++    st.caption(
++        f"Selected material: {selected_goods_name}. "
++        f"Available suppliers from database: {len(default_supplier_labels)}."
++    )
++
++    with st.form("create_case_form"):
++        quantity = st.number_input(
++            "Quantity",
++            min_value=0.01,
++            value=1.0,
++            step=1.0,
++        )
++
++        notes = st.text_area("Notes", height=80)
++
++        auto_send_messages = st.checkbox(
++            "Send real messages for this case",
++            value=False,
++            help=(
++                "Checked: automatic buyer messages use each supplier's real "
++                "email or WhatsApp channel. Unchecked: all outbound messages "
++                "stay in the Streamlit chat for simulation."
++            ),
++        )
++
++        selected_supplier_labels = st.multiselect(
++            "Suppliers",
++            options=list(supplier_labels.keys()),
++            default=default_supplier_labels,
+             help=(
+-                "Start typing to search. Only materials imported from the "
+-                "buyer supplier filter database can be selected."
++                "Only suppliers marked with X for the selected material "
++                "are shown. You can still uncheck suppliers for this case."
+             ),
+         )
+ 
+-        selected_material = material_labels[selected_material_label]
+-        selected_goods_name = selected_material["goods_name"]
++        submitted = st.form_submit_button(
++            "Create case",
++            type="primary",
++            use_container_width=True,
++        )
++
++    if not submitted:
++        return
++
++    if not selected_supplier_labels:
++        st.error("Select at least one supplier before creating the case.")
++        return
++
++    try:
++        supplier_ids = [
++            supplier_labels[label]
++            for label in selected_supplier_labels
++        ]
++
++        case_id = create_case(
++            item_material=selected_goods_name,
++            quantity=quantity,
++            notes=notes,
++            supplier_ids=supplier_ids,
++            auto_send_messages=auto_send_messages,
++        )
++
++        st.session_state["selected_case_id"] = case_id
++        st.session_state["case_created_message"] = (
++            f"Case created successfully: ID {case_id}."
++        )
++        st.rerun()
+ 
+-        suppliers = list_suppliers_for_material(selected_goods_name)
++    except Exception as exc:
++        st.error(str(exc))
+ 
+-        if not suppliers:
+-            st.warning(
+-                "No active suppliers are linked to this material. "
+-                "Choose another material or re-import the supplier workbook."
+-            )
+-        else:
+-            supplier_labels = {
+-                f"{supplier['name']} | {supplier.get('contact_channel') or 'manual'} | "
+-                f"{supplier.get('email') or supplier.get('whatsapp_number') or 'no contact'}": supplier["id"]
+-                for supplier in suppliers
+-            }
+-
+-            default_supplier_labels = list(supplier_labels.keys())
+-
+-            st.caption(
+-                f"Selected material: {selected_goods_name}. "
+-                f"Available suppliers from database: {len(default_supplier_labels)}."
+-            )
+-
+-            with st.form("create_case_form"):
+-                quantity = st.number_input(
+-                    "Quantity",
+-                    min_value=0.01,
+-                    value=1.0,
+-                    step=1.0,
+-                )
+-
+-                notes = st.text_area("Notes", height=80)
+-
+-                auto_send_messages = st.checkbox(
+-                    "Send real messages for this case",
+-                    value=False,
+-                    help=(
+-                        "Checked: automatic buyer messages use each supplier's real "
+-                        "email or WhatsApp channel. Unchecked: all outbound messages "
+-                        "stay in the Streamlit chat for simulation."
+-                    ),
+-                )
+-
+-                selected_supplier_labels = st.multiselect(
+-                    "Suppliers",
+-                    options=list(supplier_labels.keys()),
+-                    default=default_supplier_labels,
+-                    help=(
+-                        "Only suppliers marked with X for the selected material "
+-                        "are shown. You can still uncheck suppliers for this case."
+-                    ),
+-                )
+-
+-                submitted = st.form_submit_button("Create case")
+-
+-                if submitted:
+-                    try:
+-                        supplier_ids = [
+-                            supplier_labels[label]
+-                            for label in selected_supplier_labels
+-                        ]
+-
+-                        case_id = create_case(
+-                            item_material=selected_goods_name,
+-                            quantity=quantity,
+-                            notes=notes,
+-                            supplier_ids=supplier_ids,
+-                            auto_send_messages=auto_send_messages,
+-                        )
+-
+-                        st.session_state["selected_case_id"] = case_id
+-                        st.success(f"Case created: ID {case_id}")
+-                        st.rerun()
+ 
+-                    except Exception as exc:
+-                        st.error(str(exc))
++header_col, create_case_col = st.columns([5, 1])
+ 
++with header_col:
++    st.title("AI Purchase Assistant")
++
++with create_case_col:
++    st.write("")
++    if st.button(
++        "＋ New case",
++        type="primary",
++        use_container_width=True,
++        key="open_create_case_dialog",
++    ):
++        show_create_case_dialog()
++
++case_created_message = st.session_state.pop("case_created_message", None)
++if case_created_message:
++    st.success(case_created_message)
+ 
+ cases = list_cases()
+ if not cases:

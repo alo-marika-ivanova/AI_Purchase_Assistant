@@ -1,0 +1,26 @@
+{
+  "mode": "testing",
+
+  "testing_rfq_reminder_wait_minutes": 2,
+  "testing_rfq_deadline_minutes": 4,
+  "testing_negotiation_reply_wait_minutes": 2,
+  "testing_negotiation_finalization_minutes": 4,
+
+  "production_rfq_reminder_business_days": 1,
+  "production_rfq_deadline_business_days": 2,
+  "production_negotiation_reply_business_days": 1,
+  "production_negotiation_finalization_business_days": 2,
+
+  "minimum_valid_offers": 2,
+  "allow_limited_competition_with_one_offer": true,
+
+  "target_discount_percent": 10,
+  "acceptance_tolerance_above_target_percent": 5,
+
+  "max_rfq_reminders": 1,
+  "max_discount_requests_per_supplier": 2,
+  "max_negotiation_reminders_per_supplier": 1,
+  "max_outbound_without_supplier_reply": 2,
+
+  "pause_on_unknown_or_risky_topic": true
+}
