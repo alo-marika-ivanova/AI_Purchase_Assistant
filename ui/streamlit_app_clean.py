@@ -666,11 +666,23 @@ with main_col:
                 extraction = result["extraction"]
 
                 if result["saved_offer_id"]:
-                    st.success(
-                        f"Supplier response recorded. "
-                        f"Offer saved: USD {extraction['unit_price_usd']}. "
-                        f"Created {len(negotiation_result['actions'])} automatic message(s)."
-                    )
+                    offer_status = extraction.get("offer_status", "confirmed")
+
+                    if offer_status == "provisional":
+                        st.info(
+                            f"Supplier response recorded. Provisional price "
+                            f"stored: USD {extraction['unit_price_usd']}. "
+                            "It is excluded from comparison until confirmed. "
+                            f"Created {len(negotiation_result['actions'])} "
+                            "automatic message(s)."
+                        )
+                    else:
+                        st.success(
+                            f"Supplier response recorded. Confirmed offer "
+                            f"saved: USD {extraction['unit_price_usd']}. "
+                            f"Created {len(negotiation_result['actions'])} "
+                            "automatic message(s)."
+                        )
                 else:
                     st.info(
                         "Supplier response recorded. "
@@ -711,7 +723,17 @@ with main_col:
                     ).get("state", "NOT_CONTACTED"),
                     "Channel": row["channel"],
                     "Email": row["email"],
-                    "Best unit price USD": row["best_unit_price_usd"],
+                    "Best confirmed price USD": row["best_unit_price_usd"],
+                    "Provisional price USD": row["provisional_unit_price_usd"],
+                    "Offer status": (
+                        "Confirmed"
+                        if row["best_unit_price_usd"] is not None
+                        else (
+                            "Awaiting confirmation"
+                            if row["provisional_unit_price_usd"] is not None
+                            else "No price"
+                        )
+                    ),
                     "Confidence": row["best_offer_confidence"],
                 }
                 for row in overview_rows
@@ -767,7 +789,14 @@ with main_col:
 
             with col2:
                 if not supplier_has_offer:
-                    st.caption("No confirmed offer")
+                    provisional_price = row.get("provisional_unit_price_usd")
+                    if provisional_price is not None:
+                        st.caption(
+                            f"Provisional USD {provisional_price}; "
+                            "awaiting confirmation"
+                        )
+                    else:
+                        st.caption("No confirmed offer")
                 else:
                     st.caption("Confirmed offer available")
 
