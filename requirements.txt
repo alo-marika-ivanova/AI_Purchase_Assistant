@@ -9,3 +9,5 @@ uvicorn
 openpyxl==3.1.5
 
 pytest==9.0.2
+
+anthropic
