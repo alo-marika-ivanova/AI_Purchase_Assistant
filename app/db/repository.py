@@ -443,6 +443,7 @@ class PurchasingRepository:
         extraction_method: str,
         extraction_confidence: str,
         notes: str | None,
+        status: str = "active",
     ) -> int:
         total_price_usd = None
         if quantity is not None and quantity > 0:
@@ -455,9 +456,9 @@ class PurchasingRepository:
                 (
                     case_id, supplier_id, message_id, unit_price_usd,
                     quantity, total_price_usd, extraction_method,
-                    extraction_confidence, notes
+                    extraction_confidence, status, notes
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     case_id,
@@ -468,6 +469,7 @@ class PurchasingRepository:
                     total_price_usd,
                     extraction_method,
                     extraction_confidence,
+                    status,
                     notes,
                 ),
             )
@@ -479,7 +481,13 @@ class PurchasingRepository:
                 INSERT INTO negotiation_events (case_id, event_type, details)
                 VALUES (?, 'offer_recorded', ?)
                 """,
-                (case_id, f"Offer recorded: supplier ID {supplier_id}, unit price USD {unit_price_usd}."),
+                (
+                    case_id,
+                    (
+                        f"Offer recorded: supplier ID {supplier_id}, "
+                        f"unit price USD {unit_price_usd}, status {status}."
+                    ),
+                ),
             )
 
             conn.execute(
@@ -493,6 +501,64 @@ class PurchasingRepository:
             conn.commit()
 
         return offer_id
+
+    def get_latest_provisional_offer_for_case_supplier(
+        self,
+        case_id: int,
+        supplier_id: int,
+    ) -> dict | None:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    o.id AS offer_id,
+                    o.case_id,
+                    o.supplier_id,
+                    o.message_id,
+                    o.unit_price_usd,
+                    o.extraction_method,
+                    o.extraction_confidence,
+                    o.status,
+                    o.notes,
+                    o.created_at
+                FROM offers o
+                WHERE o.case_id = ?
+                  AND o.supplier_id = ?
+                  AND o.status = 'provisional'
+                ORDER BY o.id DESC
+                LIMIT 1
+                """,
+                (case_id, supplier_id),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def supersede_provisional_offers_for_case_supplier(
+        self,
+        case_id: int,
+        supplier_id: int,
+        reason: str,
+    ) -> int:
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE offers
+                SET
+                    status = 'superseded',
+                    notes = CASE
+                        WHEN notes IS NULL OR TRIM(notes) = '' THEN ?
+                        ELSE notes || ' | ' || ?
+                    END
+                WHERE case_id = ?
+                  AND supplier_id = ?
+                  AND status = 'provisional'
+                """,
+                (reason, reason, case_id, supplier_id),
+            )
+            updated_count = int(cursor.rowcount)
+            conn.commit()
+
+        return updated_count
 
     def list_offers_for_case(self, case_id: int) -> list[dict]:
         with get_connection() as conn:
@@ -2513,6 +2579,7 @@ class PurchasingRepository:
                 JOIN suppliers s ON s.id = o.supplier_id
                 WHERE o.case_id = ?
                   AND o.supplier_id = ?
+                  AND o.status = 'active'
                 ORDER BY o.unit_price_usd ASC, o.id DESC
                 LIMIT 1
                 """,

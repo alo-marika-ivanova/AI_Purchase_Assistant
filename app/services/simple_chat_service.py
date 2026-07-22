@@ -18,6 +18,9 @@ from app.negotiation.rfq_rules import RfqRuleAction, plan_rfq_stage_actions
 from app.negotiation.actions import NegotiationAction, NegotiationActionType
 from app.negotiation.negotiation_rules import plan_initial_target_price_actions
 from app.negotiation.states import CaseState, SupplierState
+from app.negotiation.supplier_message_policy import (
+    decide_supplier_message_policy,
+)
 from app.negotiation.policy import load_negotiation_policy
 from app.negotiation.comparison import prepare_case_for_negotiation
 from app.llm.supplier_message_classifier import (
@@ -460,6 +463,13 @@ def record_supplier_message_simple(
 
     supplier_text = _extract_supplier_authored_text(clean_body)
 
+    latest_provisional_offer = (
+        repo.get_latest_provisional_offer_for_case_supplier(
+            case_id=case_id,
+            supplier_id=supplier_id,
+        )
+    )
+
     analysis = analyze_supplier_message_with_ollama(
         message_body=supplier_text,
         case_data=case_data,
@@ -468,14 +478,30 @@ def record_supplier_message_simple(
         conversation_stage=conversation_stage,
         supplier_state=supplier_state,
         target_price_usd=None,
+        provisional_price_usd=(
+            float(latest_provisional_offer["unit_price_usd"])
+            if latest_provisional_offer is not None
+            else None
+        ),
     )
 
-    action = analysis["recommended_action"]
-    extraction_method = (
-        "deterministic_rfq_price_parser"
-        if analysis.get("provider") == "deterministic"
-        else "ollama_semantic_classifier"
-    )
+    analyzer_recommended_action = analysis.get("recommended_action")
+    policy_decision = decide_supplier_message_policy(analysis)
+    analysis = {
+        **analysis,
+        "analyzer_recommended_action": analyzer_recommended_action,
+        "recommended_action": policy_decision.action,
+        "policy_action": policy_decision.action,
+        "policy_reason": policy_decision.reason,
+    }
+    action = policy_decision.action
+    provider = analysis.get("provider")
+    if provider == "deterministic":
+        extraction_method = "deterministic_rfq_price_parser"
+    elif provider == "deterministic_context":
+        extraction_method = "deterministic_context_confirmation"
+    else:
+        extraction_method = "ollama_semantic_classifier"
 
     def pause_for_review(
         review_type: str,
@@ -526,6 +552,77 @@ def record_supplier_message_simple(
             "review_item_id": review_item_id,
         }
 
+    if action == "SAVE_PROVISIONAL_OFFER_AND_WAIT":
+        unit_price_usd = analysis.get("unit_price_usd")
+
+        if unit_price_usd is None:
+            return pause_for_review(
+                review_type="invalid_provisional_offer_result",
+                reason=(
+                    "The analyzer identified a tentative price but did not "
+                    "return a usable unit price."
+                ),
+            )
+
+        repo.supersede_provisional_offers_for_case_supplier(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            reason=(
+                "Superseded by a newer provisional price from the supplier."
+            ),
+        )
+
+        saved_offer_id = add_offer(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            unit_price_usd=float(unit_price_usd),
+            quantity=None,
+            message_id=inbound_message_id,
+            extraction_method=extraction_method,
+            extraction_confidence=analysis.get("confidence", "low"),
+            notes=analysis.get("reason", ""),
+            status="provisional",
+        )
+
+        repo.set_supplier_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.AWAITING_PRICE_CONFIRMATION.value,
+        )
+
+        repo.set_supplier_policy_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.AWAITING_PRICE_CONFIRMATION.value,
+        )
+
+        repo.update_case_status_with_event(
+            case_id=case_id,
+            status=CaseState.COLLECTING_OFFERS.value,
+            event_type="provisional_supplier_price_recorded",
+            details=(
+                f"Supplier stated a provisional unit price of USD "
+                f"{float(unit_price_usd):.2f}. It is excluded from comparison "
+                "until confirmed."
+            ),
+        )
+
+        return {
+            "inbound_message_id": inbound_message_id,
+            "analysis": analysis,
+            "classification": analysis,
+            "extraction": {
+                "unit_price_usd": float(unit_price_usd),
+                "confidence": analysis.get("confidence", "low"),
+                "method": extraction_method,
+                "needs_review": False,
+                "offer_status": "provisional",
+                "reason": analysis.get("reason", ""),
+            },
+            "saved_offer_id": saved_offer_id,
+            "review_item_id": None,
+        }
+
     if action == "SAVE_OFFER":
         unit_price_usd = analysis.get("unit_price_usd")
 
@@ -537,6 +634,15 @@ def record_supplier_message_simple(
                     "return a usable unit price."
                 ),
             )
+
+        repo.supersede_provisional_offers_for_case_supplier(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            reason=(
+                "Superseded because the supplier subsequently provided a "
+                "confirmed price."
+            ),
+        )
 
         saved_offer_id = add_offer(
             case_id=case_id,
@@ -599,6 +705,7 @@ def record_supplier_message_simple(
                 "confidence": analysis.get("confidence", "low"),
                 "method": extraction_method,
                 "needs_review": False,
+                "offer_status": "confirmed",
                 "reason": analysis.get("reason", ""),
             },
             "saved_offer_id": saved_offer_id,
@@ -869,6 +976,12 @@ def build_supplier_overview(case_id: int) -> list[dict]:
     for supplier in suppliers:
         supplier_id = int(supplier["id"])
         best_offer = repo.get_best_offer_for_case_supplier(case_id, supplier_id)
+        provisional_offer = (
+            repo.get_latest_provisional_offer_for_case_supplier(
+                case_id=case_id,
+                supplier_id=supplier_id,
+            )
+        )
 
         rows.append(
             {
@@ -884,6 +997,16 @@ def build_supplier_overview(case_id: int) -> list[dict]:
                     best_offer["extraction_confidence"] if best_offer else None
                 ),
                 "offer_id": best_offer["offer_id"] if best_offer else None,
+                "provisional_unit_price_usd": (
+                    provisional_offer["unit_price_usd"]
+                    if provisional_offer
+                    else None
+                ),
+                "provisional_offer_id": (
+                    provisional_offer["offer_id"]
+                    if provisional_offer
+                    else None
+                ),
             }
         )
 
@@ -1330,6 +1453,7 @@ def execute_rfq_rule_action(
         raise ValueError("Supplier ID is required for supplier action.")
 
     policy = load_negotiation_policy()
+    provisional_price_for_message: float | None = None
 
     # ------------------------------------------------------------------
     # Execution-level anti-duplicate and anti-spam guards.
@@ -1521,6 +1645,78 @@ def execute_rfq_rule_action(
 
         action_key = f"SEND_CLARIFICATION_REQUEST:{action.supplier_id}:1"
 
+    elif action.action_type == "SEND_PROVISIONAL_PRICE_ACKNOWLEDGEMENT":
+        state = repo.get_supplier_state(
+            case_id=action.case_id,
+            supplier_id=action.supplier_id,
+        )
+        state_value = (
+            state["state"]
+            if state
+            else SupplierState.NOT_CONTACTED.value
+        )
+        if state_value != SupplierState.AWAITING_PRICE_CONFIRMATION.value:
+            return {
+                "action": action.action_type,
+                "supplier_id": action.supplier_id,
+                "skipped": True,
+                "reason": (
+                    "Provisional-price acknowledgment skipped because the "
+                    "supplier is no longer awaiting price confirmation."
+                ),
+            }
+
+        provisional_offer = (
+            repo.get_latest_provisional_offer_for_case_supplier(
+                case_id=action.case_id,
+                supplier_id=action.supplier_id,
+            )
+        )
+        if provisional_offer is None:
+            return {
+                "action": action.action_type,
+                "supplier_id": action.supplier_id,
+                "skipped": True,
+                "reason": "No provisional offer is available to acknowledge.",
+            }
+
+        acknowledgement_count = repo.count_supplier_outbound_message_type(
+            case_id=action.case_id,
+            supplier_id=action.supplier_id,
+            message_type="provisional_price_acknowledgement",
+        )
+        if acknowledgement_count > 0:
+            return {
+                "action": action.action_type,
+                "supplier_id": action.supplier_id,
+                "skipped": True,
+                "reason": "Provisional price was already acknowledged.",
+            }
+
+        history_for_guard = repo.list_messages_for_case_supplier(
+            case_id=action.case_id,
+            supplier_id=action.supplier_id,
+        )
+        latest_message = history_for_guard[-1] if history_for_guard else None
+        if not latest_message or latest_message.get("direction") != "inbound":
+            return {
+                "action": action.action_type,
+                "supplier_id": action.supplier_id,
+                "skipped": True,
+                "reason": (
+                    "Provisional-price acknowledgment skipped because the "
+                    "latest message is not inbound."
+                ),
+            }
+
+        provisional_price_for_message = float(
+            provisional_offer["unit_price_usd"]
+        )
+        action_key = (
+            f"SEND_PROVISIONAL_PRICE_ACKNOWLEDGEMENT:"
+            f"{action.supplier_id}:{provisional_offer['offer_id']}"
+        )
+
     elif action.action_type == "SEND_CASE_ANSWER":
         state = repo.get_supplier_state(
             case_id=action.case_id,
@@ -1619,6 +1815,14 @@ def execute_rfq_rule_action(
             "Do not negotiate. Do not mention AI or internal rules."
         )
 
+    elif action.action_type == "SEND_PROVISIONAL_PRICE_ACKNOWLEDGEMENT":
+        extra_context = (
+            "The supplier stated a tentative unit price and said they still "
+            "need to verify it internally. Thank them, mention the provisional "
+            "amount exactly, ask them to confirm it after verification, and do "
+            "not describe it as accepted or final."
+        )
+
     elif action.action_type == "SEND_CASE_ANSWER":
         extra_context = (
             "Answer the supplier's latest question using only facts present in the "
@@ -1634,6 +1838,7 @@ def execute_rfq_rule_action(
         case_data=case_data,
         supplier=supplier,
         message_history=history,
+        supplier_best_price_usd=provisional_price_for_message,
         extra_context=extra_context,
     )
 
@@ -1710,6 +1915,26 @@ def execute_rfq_rule_action(
             status=CaseState.COLLECTING_OFFERS.value,
             event_type="clarification_request_sent",
             details=f"Clarification request sent/generated for supplier {supplier['name']}.",
+        )
+
+    elif action.action_type == "SEND_PROVISIONAL_PRICE_ACKNOWLEDGEMENT":
+        repo.set_supplier_state(
+            case_id=action.case_id,
+            supplier_id=action.supplier_id,
+            state=SupplierState.AWAITING_PRICE_CONFIRMATION.value,
+        )
+        repo.set_supplier_policy_state(
+            case_id=action.case_id,
+            supplier_id=action.supplier_id,
+            state=SupplierState.AWAITING_PRICE_CONFIRMATION.value,
+        )
+        repo.log_worker_event(
+            case_id=action.case_id,
+            event_type="provisional_price_acknowledged",
+            details=(
+                f"Acknowledged provisional price from supplier "
+                f"{supplier['name']} and requested confirmation."
+            ),
         )
 
     elif action.action_type == "SEND_CASE_ANSWER":
