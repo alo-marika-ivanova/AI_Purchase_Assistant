@@ -1,159 +1,270 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file guides Claude Code when working with this repository.
 
-## What this is
+## Scope of these instructions
 
-An AI-assisted purchasing/negotiation assistant. Buyers create a "case" (an item + quantity to
-procure), the system contacts candidate suppliers over email or WhatsApp, an Ollama-backed LLM
-classifies inbound supplier replies and extracts offers, a rules engine drives the negotiation
-state machine (RFQ → price extraction → discount negotiation → winner selection), and a Streamlit
-UI plus a FastAPI webhook provide the human-facing surfaces.
+These instructions are default safety and architectural guidelines, not permanent
+restrictions on future development.
+
+An explicit user request may authorize new functionality or changes to the database
+schema, public interfaces, architecture, business rules, or existing workflows.
+
+When a requested feature conflicts with a guideline in this file, explain the conflict,
+identify the affected components, and propose a safe implementation plan. Proceed after
+the user approves the intended change.
+
+## Project
+
+This is an internal purchasing and price-negotiation assistant for one buyer.
+
+The system:
+
+* creates purchasing cases;
+* contacts suppliers by email or WhatsApp;
+* receives and classifies supplier replies;
+* extracts and compares offers;
+* negotiates price;
+* escalates unclear or risky cases for human review;
+* proposes a winner;
+* requires human approval before winner notification.
+
+The LLM may classify messages, extract structured information, and generate supplier-facing text.
+
+Deterministic Python code must continue to control:
+
+* reminders and deadlines;
+* negotiation attempts;
+* state transitions;
+* target-price calculations;
+* human-review rules;
+* winner approval.
+
+## Negotiation rules
+
+`docs/rules.md` is the authoritative functional specification for negotiation behavior.
+
+Before changing any logic related to:
+
+* RFQs;
+* reminders;
+* deadlines;
+* offer validation;
+* price extraction;
+* negotiation attempts;
+* target prices;
+* human review;
+* supplier states;
+* winner selection or notification;
+
+read `docs/rules.md` and compare the planned change against it.
+
+If the code, tests, and `docs/rules.md` disagree, report the conflict before changing behavior. Do not silently change the rules or modify tests only to make them pass.
 
 ## Commands
 
-Run everything through the project venv's Python (`.venv\Scripts\python.exe` on Windows).
+Run commands through the project virtual environment.
 
 ```powershell
-# Run the full test suite
+# Full test suite
 .venv\Scripts\python.exe -m pytest -q .\tests
 
-# Run a single test file / test
+# One test file
 .venv\Scripts\python.exe -m pytest -q tests\test_rfq_lifecycle.py
-.venv\Scripts\python.exe -m pytest -q tests\test_rfq_lifecycle.py::test_some_case -v
 
-# Streamlit UI (buyer-facing app)
+# Streamlit UI
 .venv\Scripts\streamlit.exe run ui\streamlit_app_clean.py
 
-# FastAPI app (WhatsApp webhook + /health)
+# FastAPI
 .venv\Scripts\uvicorn.exe app.main:app --reload
 
-# Background worker that polls the mailbox and advances negotiations
+# Email worker
 .venv\Scripts\python.exe scripts\email_worker.py
 
-# One-off: import supplier/material catalog from data\supplier_catalog.xlsx
-.venv\Scripts\python.exe scripts\import_supplier_filter_xlsx.py
-
-# Initialize/create the SQLite schema without starting anything else
+# Initialize database
 .venv\Scripts\python.exe scripts\init_db.py
 ```
 
-There is no lint/format tooling configured in this repo (no ruff/black/flake8 config) — don't
-invent lint commands. `requirements.txt` is the single dependency source (no lockfile,
-no pyproject.toml).
+There is no configured linting or formatting workflow. Do not invent Ruff, Black, Flake8, or similar commands.
+
+`requirements.txt` is the dependency source.
 
 ## Architecture
 
-### Layering
+```text
+ui/streamlit_app_clean.py
+    Buyer-facing UI.
 
+app/main.py
+    FastAPI application and WhatsApp webhook.
+
+scripts/email_worker.py
+    Background email polling worker.
+
+app/services/*
+    Application orchestration and side effects.
+
+app/negotiation/*
+    Deterministic negotiation rules and policy.
+
+app/llm/*
+    Classification, extraction, safeguards, and message generation.
+
+app/integrations/*
+    SMTP, Microsoft Graph, and WhatsApp integrations.
+
+app/db/repository.py
+    Central database-access layer.
+
+app/db/database.py
+    SQLite connection and schema initialization.
 ```
-ui/streamlit_app_clean.py   Buyer-facing UI — calls services directly, no HTTP layer
-app/main.py                 FastAPI app — mounts only the WhatsApp webhook + /health
-scripts/email_worker.py     Polling loop; calls transport_worker_service on a timer
-        ↓
-app/services/*              Orchestration: one call here = one buyer action or one worker tick
-app/negotiation/*           Pure(ish) rules/policy: decides WHAT should happen next
-app/llm/*                   Ollama-backed classification/generation (supplier replies → structured
-                             intent+offer JSON; buyer messages → natural-language text)
-app/integrations/*          Outbound/inbound transport: SMTP, MS Graph (inbound email),
-                             WhatsApp Cloud API
-app/db/repository.py        Single repository class (PurchasingRepository) — ALL SQL lives here
-app/db/database.py          Connection + schema bootstrap (SQLite, WAL mode)
-```
 
-Everything funnels through `app.db.repository.PurchasingRepository`. Do not write raw SQL
-elsewhere — add a method to the repository (it's large, ~3800 lines, but it is intentionally
-the only place that touches `sqlite3` directly). `app/db/database.get_connection()` is the only
-place a connection is opened; `initialize_database()` runs `schema.sql` idempotently
-(`CREATE TABLE IF NOT EXISTS`) — schema changes must stay additive/non-destructive, matching the
-migration style already used for tables like `case_notification_preferences`.
+Keep UI, services, negotiation rules, LLM logic, integrations, and database access separate.
 
-### Negotiation state machine
+All SQL is currently centralized in `PurchasingRepository`. Do not add raw SQL outside the database layer.
 
-`app/negotiation/states.py` defines two enums that drive everything:
-- `CaseState` — case-level lifecycle (DRAFT → READY_TO_START → CONTACTING_SUPPLIERS →
-  COLLECTING_OFFERS → NEGOTIATING → BUYER_REVIEW → WINNER_SELECTED → ... → CLOSED).
-- `SupplierState` — per-(case, supplier) lifecycle (NOT_CONTACTED → REQUEST_SENT → ... →
-  FINAL_OFFER_RECEIVED/NO_RESPONSE/REJECTED/WINNER, with `PAUSED_REVIEW` as an escape hatch to
-  human review). `TERMINAL_SUPPLIER_STATES` marks which states end that supplier's involvement.
+Schema changes should be additive, non-destructive, and safe for existing databases.
 
-`app/negotiation/policy.py` (`NegotiationPolicy`, loaded from `config/negotiation_policy.json`)
-holds all tunable timings/thresholds — reminder waits, deadlines, discount targets, retry caps.
-It has two timing modes:
-- `testing`: minute-based waits, for fast local iteration/tests.
-- `production`: business-day based waits.
+Do not redesign the repository or architecture as part of an unrelated feature. Explicitly requested architectural changes are allowed after a plan is approved.
 
-These are **not interchangeable units** — the dataclass raises `BusinessTimeNotImplementedError`
-if minute-based accessors (`rfq_reminder_wait_minutes`, etc.) are called while
-`mode == "production"`, specifically to prevent silently treating "1 business day" as "24 elapsed
-hours". If you add a new timing-dependent rule, follow this same testing/production split rather
-than adding a raw minutes field.
+## Negotiation state and timing
 
-Rule modules (`app/negotiation/rfq_rules.py`, `negotiation_rules.py`, `common_reply_policy.py`,
-`supplier_message_policy.py`) inspect current DB state + policy and return `*Action` dataclasses
-(e.g. `RfqRuleAction`) describing what should happen — they don't perform side effects themselves.
-The services layer (mainly `simple_chat_service.py` and `negotiation_reply_service.py`) executes
-those actions: sending messages via `app/integrations`, writing offers, updating supplier/case
-state, and — when `pause_on_unknown_or_risky_topic` fires or classification is uncertain — raising
-a human review item via `human_review_notification_service.create_human_review_item_with_notification`.
+`app/negotiation/states.py` defines case and supplier states.
 
-### LLM usage
+`app/negotiation/policy.py` and `config/negotiation_policy.json` define timings, deadlines, retry limits, target reduction, and tolerance.
 
-Both supplier-reply classification (`app/llm/supplier_message_classifier.py`) and buyer-message
-generation (`app/llm/communication_writer.py`) call a local Ollama server (`OLLAMA_URL`,
-`OLLAMA_MODEL` env vars, default `llama3.1`) via raw HTTP `requests` calls — there is no LLM
-client SDK abstraction. Classifier output is parsed into structured JSON (see
-`_extract_json_object`/`_normalize_result` in `supplier_message_classifier.py`); price safeguards
-(`app/llm/rfq_price_safeguard.py`, `rfq_tentative_price_safeguard.py`) then sanity-check any
-extracted price before it's trusted, since the LLM output is not implicitly trusted for money-bearing
-fields. `USE_LLM_COMMUNICATION_WRITER=false` (set by `tests/conftest.py`) disables the
-LLM-generated writer path during tests in favor of deterministic templates.
+There are two timing modes:
+
+* `testing`: minute-based;
+* `production`: business-day-based.
+
+Do not treat business days as elapsed hours. Keep timing values in policy configuration rather than hardcoding them in services.
+
+When changing state logic:
+
+* inspect all readers and writers of the affected state;
+* preserve delayed supplier responses after worker restarts;
+* do not send another negotiation message while waiting for a reply;
+* preserve terminal states and human-review behavior.
 
 ## LLM provider
 
-- The current implementation still uses local Ollama in some components.
-- The approved target architecture is Anthropic Claude API using Claude Sonnet.
-- Do not add new Ollama-specific dependencies or deepen the Ollama integration.
-- New LLM functionality must be implemented behind a provider-independent interface.
-- Existing Ollama calls should be migrated incrementally to a shared Claude API adapter.
-- API keys must be loaded from environment variables and must never be committed to Git.
-- The LLM may classify messages, extract structured information and generate text.
-- Deterministic Python code must continue to control reminders, deadlines, negotiation attempts, state transitions, target-price calculations and winner approval.
+The current implementation uses local Ollama in:
 
-## Migration safety
+* `app/llm/supplier_message_classifier.py`;
+* `app/llm/communication_writer.py`.
 
-- Before replacing any Ollama-related file, inspect its complete current contents.
-- Preserve all existing fallback logic and deterministic safeguards.
-- Do not remove Ollama support until the Claude API integration has been tested successfully.
-- Add regression tests before changing message classification or price extraction behavior.
+Price-related LLM output is validated by deterministic safeguards, including:
 
-### Transport / channel duality
+* `app/llm/rfq_price_safeguard.py`;
+* `app/llm/rfq_tentative_price_safeguard.py`.
 
-Every supplier has a `contact_channel` of `whatsapp` or `email` (`app/db/schema.sql`,
-`suppliers` table), and most negotiation flows branch on this. Email uses MS Graph for inbound
-polling (`app/integrations/graph_email_adapter.py`) and SMTP for outbound
-(`app/integrations/email_adapter.py`); WhatsApp uses the Cloud API for both directions
-(`app/integrations/whatsapp_adapter.py`, plus the inbound webhook in
-`app/api/whatsapp_webhook.py`). Real sends are gated by env flags — `EMAIL_DRY_RUN` (log instead
-of SMTP send) and `EMAIL_TEST_MODE`/`EMAIL_TEST_SUPPLIER_TO` (redirect supplier email to a test
-inbox) — and independently by the per-case `auto_send_messages` flag (case-level
-"real send" vs "simulation" toggle set from the Streamlit UI), consumed in
-`transport_worker_service.process_case_email_transport`. When changing send behavior, respect
-both gates rather than assuming one implies the other.
+The approved target is the Anthropic Claude API, initially using a configurable Claude Sonnet model.
 
-### Tests
+When migrating:
 
-`tests/conftest.py` gives every test an isolated SQLite file (via a `tmp_path`-based
-`isolated_database` autouse fixture that monkeypatches `database_module.DB_PATH`) rather than
-mocking the database — tests run against a real, freshly-initialized schema per test. A unique
-file per test exists specifically to avoid Windows `PermissionError`/`WinError 32` from deleting
-a SQLite file while a connection is still open — don't share DB paths across tests. The
-`supplier_ids` fixture seeds one email and one WhatsApp supplier for tests that need both channels.
-`scripts/test_*.py` are standalone manual/debug scripts (not part of the `tests/` pytest suite).
+* introduce a provider-independent LLM interface;
+* use one centralized Claude adapter;
+* do not scatter direct API calls across services;
+* keep the model name configurable;
+* load API keys from environment variables or approved secret storage;
+* never commit secrets;
+* preserve all price safeguards, fallbacks, test behavior, and human-review logic;
+* keep Ollama available until the Claude implementation has been tested and approved.
 
-### Config and secrets
+Changes to classification or price extraction must include regression tests using realistic difficult supplier messages.
 
-`.env` (not committed; see `.env.example` for the full variable list) drives Ollama, SMTP, MS
-Graph, WhatsApp, and worker behavior. `.claude/settings.json` denies Claude Code read access to
-`.env`, secrets, DB files, and attachment/upload directories — respect that boundary rather than
-routing around it (e.g. don't `cat` `.env` via Bash).
+Do not change negotiation business rules as part of the LLM-provider migration unless explicitly requested.
+
+## Communication safety
+
+Each supplier uses either `email` or `whatsapp`.
+
+Email:
+
+* inbound: Microsoft Graph;
+* outbound: SMTP.
+
+WhatsApp:
+
+* inbound: FastAPI webhook;
+* outbound: WhatsApp Cloud API.
+
+Email sending is controlled by:
+
+* `EMAIL_DRY_RUN`;
+* `EMAIL_TEST_MODE`;
+* `EMAIL_TEST_SUPPLIER_TO`.
+
+Sending is also controlled by the case-level `auto_send_messages` setting.
+
+Preserve both global and case-level safety controls. Do not send real supplier messages from tests or bypass redirection.
+
+## Tests
+
+Each pytest test uses its own temporary SQLite database through `tests/conftest.py`.
+
+Do not share database paths between tests. Ensure SQLite connections are closed, especially on Windows, where open files may cause `PermissionError` or `WinError 32`.
+
+`scripts/test_*.py` files are manual/debug scripts and are not part of the normal pytest suite.
+
+For behavioral changes:
+
+1. add or update focused regression tests;
+2. run the affected tests;
+3. run the full suite;
+4. report the exact commands and results;
+5. do not claim tests passed unless they were run.
+
+## Secrets
+
+`.env` is not committed. Document new variables in `.env.example`.
+
+`.claude/settings.json` denies Claude Code access to secrets, databases, attachments, and uploads.
+
+Respect that boundary. Do not bypass it through shell commands or scripts.
+
+Never expose or commit API keys, tokens, passwords, confidential supplier data, or production database contents.
+
+## Change safety
+
+These are default safety rules, not permanent restrictions on future development.
+
+An explicit user request may authorize new functionality or changes to the database, interfaces, architecture, rules, or workflows.
+
+For substantial changes:
+
+1. inspect the relevant code;
+2. read `docs/rules.md` when negotiation behavior is affected;
+3. identify affected files;
+4. present a plan;
+5. identify unresolved business decisions;
+6. edit after approval.
+
+When editing:
+
+* read complete affected files;
+* do not replace files with shortened reconstructions;
+* do not remove unrelated code;
+* avoid unrelated refactoring;
+* preserve existing behavior unless a change is explicitly requested.
+
+After editing:
+
+* list changed files;
+* show or summarize the diff;
+* run relevant tests;
+* report remaining risks.
+
+Do not commit, push, merge, deploy, or modify production data unless explicitly requested.
+
+## Documentation
+
+Keep this file concise and aligned with the repository.
+
+* Describe current functionality as current.
+* Describe planned functionality as planned.
+* Update this file when major architecture changes are completed.
+* Keep detailed documentation under `docs/`.
+* Read large documents only when relevant to the current task.
