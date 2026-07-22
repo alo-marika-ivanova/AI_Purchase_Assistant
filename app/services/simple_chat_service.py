@@ -501,7 +501,7 @@ def record_supplier_message_simple(
     elif provider == "deterministic_context":
         extraction_method = "deterministic_context_confirmation"
     else:
-        extraction_method = "ollama_semantic_classifier"
+        extraction_method = "llm_semantic_classifier"
 
     def pause_for_review(
         review_type: str,

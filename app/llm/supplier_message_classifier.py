@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 import os
-import urllib.request
 from typing import Any
 
 from dotenv import load_dotenv
 
+from app.llm.json_utils import extract_json_object
+from app.llm.provider import get_llm_provider
 from app.llm.rfq_price_safeguard import (
     build_deterministic_rfq_offer_result,
     extract_safe_simple_rfq_unit_price,
@@ -22,13 +22,8 @@ from app.llm.supplier_message_analysis import add_structured_dimensions
 
 load_dotenv()
 
-OLLAMA_URL = os.getenv(
-    "OLLAMA_URL",
-    "http://localhost:11434/api/generate",
-)
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
-OLLAMA_CLASSIFIER_TIMEOUT_SECONDS = int(
-    os.getenv("OLLAMA_CLASSIFIER_TIMEOUT_SECONDS", "60")
+CLASSIFIER_TIMEOUT_SECONDS = int(
+    os.getenv("LLM_CLASSIFIER_TIMEOUT_SECONDS", "60")
 )
 DEFAULT_NEGOTIATION_CURRENCY = os.getenv(
     "DEFAULT_NEGOTIATION_CURRENCY",
@@ -170,28 +165,6 @@ def _format_recent_history(
     return "\n".join(lines) if lines else "No previous conversation."
 
 
-def _extract_json_object(raw_text: str) -> dict:
-    clean_text = (raw_text or "").strip()
-
-    if clean_text.startswith("```"):
-        clean_text = clean_text.replace("```json", "", 1)
-        clean_text = clean_text.replace("```", "").strip()
-
-    try:
-        parsed = json.loads(clean_text)
-    except json.JSONDecodeError:
-        first_brace = clean_text.find("{")
-        last_brace = clean_text.rfind("}")
-        if first_brace < 0 or last_brace <= first_brace:
-            raise ValueError("Classifier returned no valid JSON object.")
-        parsed = json.loads(clean_text[first_brace:last_brace + 1])
-
-    if not isinstance(parsed, dict):
-        raise ValueError("Classifier output is not a JSON object.")
-
-    return parsed
-
-
 def _nullable_float(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
@@ -287,6 +260,9 @@ def _normalize_result(
     parsed: dict,
     conversation_stage: str,
     target_price_usd: float | None,
+    provider_name: str,
+    model_name: str | None,
+    provisional_price_usd: float | None = None,
 ) -> dict:
     parsed = _apply_default_currency_rule(parsed, conversation_stage)
 
@@ -385,6 +361,27 @@ def _normalize_result(
         has_multiple_prices = False
         is_conditional = False
         supplier_accepts_target = True
+        requires_human_review = False
+
+    # A plain-language confirmation of a previously stored provisional price
+    # (e.g. "this is a confirmed price", "confirmed") supersedes that price
+    # even when the model doesn't repeat the number itself.
+    if (
+        normalized_stage == "RFQ"
+        and category == "CLEAR_PRICE_OFFER"
+        and model_action == "SAVE_OFFER"
+        and unit_price_usd is None
+        and provisional_price_usd is not None
+        and provisional_price_usd > 0
+    ):
+        stated_price_amount = float(provisional_price_usd)
+        unit_price_usd = float(provisional_price_usd)
+        currency = "USD"
+        price_basis = "UNIT"
+        is_price_clear = True
+        is_currency_clear = True
+        has_multiple_prices = False
+        is_conditional = False
         requires_human_review = False
 
     if category in NO_PRICE_FACT_CATEGORIES:
@@ -517,12 +514,12 @@ def _normalize_result(
     }
 
     if not reason:
-        reason = "The supplier message was interpreted by the local LLM."
+        reason = "The supplier message was interpreted by the LLM classifier."
 
     return add_structured_dimensions({
         "success": True,
-        "provider": "ollama",
-        "model": OLLAMA_MODEL,
+        "provider": provider_name,
+        "model": model_name,
         "message_category": category,
         "recommended_action": action,
         "safe_for_automation": safe_for_automation,
@@ -555,11 +552,15 @@ def _normalize_result(
     })
 
 
-def _failure_result(error: str) -> dict:
+def _failure_result(
+    error: str,
+    provider_name: str,
+    model_name: str | None,
+) -> dict:
     return add_structured_dimensions({
         "success": False,
-        "provider": "ollama",
-        "model": OLLAMA_MODEL,
+        "provider": provider_name,
+        "model": model_name,
         "message_category": "UNKNOWN",
         "recommended_action": "PAUSE_FOR_REVIEW",
         "safe_for_automation": False,
@@ -580,7 +581,7 @@ def _failure_result(error: str) -> dict:
         "supplier_refused": False,
         "supplier_accepts_target": False,
         "question_can_be_answered_from_case": False,
-        "reason": "The local LLM could not safely classify the supplier message.",
+        "reason": "The LLM could not safely classify the supplier message.",
         "suggested_clarification_question": None,
         "suggested_buyer_reply": None,
         "raw_result": None,
@@ -601,7 +602,12 @@ def analyze_supplier_message_with_ollama(
 ) -> dict:
     clean_body = (message_body or "").strip()
     if not clean_body:
-        return _failure_result("Supplier message is empty.")
+        fallback_provider_name = os.getenv("LLM_PROVIDER", "claude").strip().lower()
+        return _failure_result(
+            "Supplier message is empty.",
+            provider_name=fallback_provider_name,
+            model_name=None,
+        )
 
     if (conversation_stage or "").strip().upper() == "RFQ":
         if (
@@ -644,6 +650,7 @@ Item: {case_data.get('item_material')}
 Requested quantity: {case_data.get('quantity')}
 Current supplier best price USD: {supplier_best_price_usd}
 Explicit target price USD: {target_price_usd}
+Stored provisional (unconfirmed) price USD: {provisional_price_usd}
 
 Recent conversation:
 {history_text}
@@ -662,9 +669,22 @@ Important negotiation rules:
   PRICE_REFUSAL.
 - "We will check and reply tomorrow" with no price is ACKNOWLEDGEMENT_WILL_REPLY.
 - If the supplier states one price but says it is uncertain or still needs internal
-  verification, use TENTATIVE_PRICE and SAVE_PROVISIONAL_OFFER_AND_WAIT.
+  verification, use TENTATIVE_PRICE and SAVE_PROVISIONAL_OFFER_AND_WAIT. Uncertainty
+  means an explicit hedge in the text itself, such as "I think", "probably",
+  "should be", "not 100% sure", "let me check", or "will confirm".
+- A friendly, casual, enthusiastic, or informal tone (for example "you are lucky",
+  "great news", "hi mate") is NOT a hedge by itself. A single clear USD unit price
+  with no hedge, no risk topic, and no condition is CLEAR_PRICE_OFFER (or
+  IMPROVED_PRICE_OFFER / TARGET_ACCEPTANCE depending on stage) regardless of how
+  informal the wording is. Do not read tone as uncertainty.
 - A tentative price is useful information but is not a confirmed offer and must not
   be used for ranking, target calculation, or winner selection.
+- If a stored provisional price is present and the supplier's new message plainly
+  affirms or confirms it (for example "confirmed", "yes, that's correct", "this is
+  a confirmed price", "I confirm this price") without necessarily repeating the
+  number, classify it as CLEAR_PRICE_OFFER with recommended_action=SAVE_OFFER. You
+  do not need to repeat the stored price yourself; leave unit_price_usd null if the
+  message itself does not restate it.
 - Do not confuse quoted earlier email text with the supplier's new intent.
 RISK CLASSIFICATION HAS PRIORITY OVER PRICE CLASSIFICATION.
 
@@ -709,6 +729,18 @@ Do NOT classify this example as CONDITIONAL_PRICE.
 CONDITIONAL_PRICE is reserved for price-only commercial conditions such as
 quantity tiers or volume thresholds when no risky topic is present.
 
+Example:
+"Hi, mate, you are lucky, we just got new items. The price for one unit is 22 usd."
+
+Correct result:
+- message_category=CLEAR_PRICE_OFFER
+- recommended_action=SAVE_OFFER
+- unit_price_usd=22
+- confidence=high
+
+Do NOT classify this example as TENTATIVE_PRICE. The tone is casual, but there is
+no hedge, no condition, and exactly one clear unit price.
+
 Payment, deposit, delivery, specification, quality, legal, customs,
 confidentiality, disputes, and unusual topics require human review.
 
@@ -749,33 +781,32 @@ Return exactly one JSON object with these keys:
 }}
 """
 
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "options": {"temperature": 0.0},
-    }
-
-    request = urllib.request.Request(
-        OLLAMA_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
+    provider = None
     try:
-        with urllib.request.urlopen(
-            request,
-            timeout=OLLAMA_CLASSIFIER_TIMEOUT_SECONDS,
-        ) as response:
-            response_data = json.loads(response.read().decode("utf-8"))
-
-        parsed = _extract_json_object(response_data.get("response", ""))
+        provider = get_llm_provider()
+        raw_text = provider.generate(
+            prompt,
+            timeout_seconds=CLASSIFIER_TIMEOUT_SECONDS,
+            temperature=0.0,
+        )
+        parsed = extract_json_object(raw_text)
         return _normalize_result(
             parsed=parsed,
             conversation_stage=conversation_stage,
             target_price_usd=target_price_usd,
+            provider_name=provider.name,
+            model_name=provider.model,
+            provisional_price_usd=provisional_price_usd,
         )
     except Exception as exc:
-        return _failure_result(str(exc))
+        fallback_provider_name = (
+            provider.name
+            if provider is not None
+            else os.getenv("LLM_PROVIDER", "claude").strip().lower()
+        )
+        fallback_model_name = provider.model if provider is not None else None
+        return _failure_result(
+            str(exc),
+            provider_name=fallback_provider_name,
+            model_name=fallback_model_name,
+        )

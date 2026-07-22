@@ -362,7 +362,7 @@ def record_negotiation_supplier_message(
             quantity=None,
             message_id=inbound_message_id,
             extraction_method=(
-                "ollama_plus_common_policy"
+                "llm_plus_common_policy"
             ),
             extraction_confidence=analysis.get(
                 "confidence",
@@ -442,7 +442,7 @@ def record_negotiation_supplier_message(
                     "low",
                 ),
                 "method": (
-                    "ollama_plus_common_policy"
+                    "llm_plus_common_policy"
                 ),
                 "needs_review": False,
                 "reason": (

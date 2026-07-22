@@ -18,11 +18,18 @@ repo = PurchasingRepository()
 
 
 def _extract_case_number(text: str) -> str | None:
+    # Oldest format: CASE-YYYYMMDD-HHMMSS-microseconds-6HEX
     match = re.search(r"\bCASE-\d{8}-\d{6}-\d{6}-[A-Z0-9]{6}\b", text)
     if match:
         return match.group(0)
 
+    # Previous format: CASE-YYYYMMDD-HHMMSS-6HEX
     match = re.search(r"\bCASE-\d{8}-\d{6}-[A-Z0-9]{6}\b", text)
+    if match:
+        return match.group(0)
+
+    # Current format: ITEMCODE-YYYY-MM-DD-NN (e.g. AMP-2026-07-22-01)
+    match = re.search(r"\b[A-Z0-9]{1,12}-\d{4}-\d{2}-\d{2}-\d{2,3}\b", text)
     if match:
         return match.group(0)
 
