@@ -1,13 +1,38 @@
 from __future__ import annotations
 
+import re
+import sqlite3
 from datetime import datetime
-from uuid import uuid4
 from typing import Iterable
 
 from app.db.database import get_connection
 
 
 ACTION_LOCK_LEASE_SECONDS = 300
+
+CASE_NUMBER_DATE_FORMAT = "%Y-%m-%d"
+CASE_NUMBER_MAX_ATTEMPTS = 5
+
+_PARENTHETICAL_CODE_PATTERN = re.compile(r"\(([A-Za-z0-9]{2,6})\)\s*$")
+_WORD_CHARACTERS_PATTERN = re.compile(r"[^A-Za-z0-9]")
+
+
+def _slugify_item_code(item_material: str, max_length: int = 12) -> str:
+    """Derive a short, readable case-number prefix from an item/material name.
+
+    Prefers a trailing parenthetical code already used in the supplier
+    catalog (e.g. "Amethyst Pink (AMP)" -> "AMP"); otherwise falls back to
+    the first word of the name.
+    """
+    text = (item_material or "").strip()
+
+    paren_match = _PARENTHETICAL_CODE_PATTERN.search(text)
+    if paren_match:
+        return paren_match.group(1).upper()
+
+    first_word = text.split()[0] if text else ""
+    slug = _WORD_CHARACTERS_PATTERN.sub("", first_word).upper()
+    return slug[:max_length] or "ITEM"
 
 
 class PurchasingRepository:
@@ -133,31 +158,55 @@ class PurchasingRepository:
         clean_item = item_material.strip()
         supplier_ids = list(dict.fromkeys(int(sid) for sid in supplier_ids))
 
-        now_stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        case_number = f"CASE-{now_stamp}-{uuid4().hex[:6].upper()}"
+        item_code = _slugify_item_code(clean_item)
+        date_stamp = datetime.now().strftime(CASE_NUMBER_DATE_FORMAT)
 
         with get_connection() as conn:
-            cur = conn.execute(
+            base_sequence = conn.execute(
                 """
-                INSERT INTO negotiation_cases
-                (
-                    case_number,
-                    item_material,
-                    quantity,
-                    notes,
-                    status,
-                    auto_send_messages
-                )
-                VALUES (?, ?, ?, ?, 'READY_TO_START', ?)
+                SELECT COUNT(*) AS existing_count
+                FROM negotiation_cases
+                WHERE case_number LIKE ?
                 """,
-                (
-                    case_number,
-                    clean_item,
-                    quantity,
-                    notes.strip() or None,
-                    1 if auto_send_messages else 0,
-                ),
-            )
+                (f"%-{date_stamp}-%",),
+            ).fetchone()["existing_count"] + 1
+
+            case_number = None
+            cur = None
+            for attempt in range(CASE_NUMBER_MAX_ATTEMPTS):
+                candidate = f"{item_code}-{date_stamp}-{base_sequence + attempt:02d}"
+                try:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO negotiation_cases
+                        (
+                            case_number,
+                            item_material,
+                            quantity,
+                            notes,
+                            status,
+                            auto_send_messages
+                        )
+                        VALUES (?, ?, ?, ?, 'READY_TO_START', ?)
+                        """,
+                        (
+                            candidate,
+                            clean_item,
+                            quantity,
+                            notes.strip() or None,
+                            1 if auto_send_messages else 0,
+                        ),
+                    )
+                    case_number = candidate
+                    break
+                except sqlite3.IntegrityError:
+                    continue
+
+            if case_number is None:
+                raise RuntimeError(
+                    "Could not generate a unique case number after "
+                    f"{CASE_NUMBER_MAX_ATTEMPTS} attempts."
+                )
 
             case_id = int(cur.lastrowid)
 
