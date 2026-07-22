@@ -1,227 +1,297 @@
-# Navrh pravidel pro vyjednavani AI nakupciho
+# AI Purchasing Agent Negotiation Rules
 
-## 1\. Začátek vyjednávacího případu
+## 1. Starting a Negotiation Case
 
-- Ela vytvoří vyjednávací případ (upload dat)
-- AI system vytvoří počáteční nastavení (výběr dodavatelů k notifikaci)
-- Ela potvrdí toto nastavení a spustí vyjednávání (klikne na tlačítko)
-- AI system pošle RFQ všem vybraným dodavatelům
+* Ela creates a negotiation case by uploading or entering the purchasing data.
+* The system prepares the initial setup, including the suppliers to be contacted.
+* Ela reviews and confirms the setup, then starts the negotiation.
+* The system sends an RFQ to all selected suppliers.
 
-## 2\. RFQ fáze
+## 2. RFQ Stage
 
-- RFQ je odeslán všem vybraným dodavatelům
-- RFQ požaduje:
-  - Cenu za karát v USD
-  - Potvrzení zboží a množství
-- AI system čeká na odpovědi
+* The RFQ is sent to all selected suppliers.
+* The RFQ requests:
 
-### RFQ čekací doba
+  * the unit price per carat in USD;
+  * confirmation of the requested item and quantity.
+* The system waits for supplier responses.
 
-Navrhované nastavení:
+### RFQ Waiting Period
 
-- Čekáme **1 pracovní den** po odeslání RFQ.
-- Pokud nepřijde odpověď, připomeneme se.
-- Znovu čekáme
-- Pokud nic nepřijde, označíme dodavatele jako **No response**.
-- Pokračujeme bez tohoto dodavatele, pokud máme jinak dostatek nabídek.
+Production settings:
 
-Testovací nastavení:
+* Wait **1 business day** after sending the RFQ.
+* If no response is received, send a reminder.
+* Wait again.
+* If there is still no response, mark the supplier as **No Response**.
+* Continue without that supplier if enough other offers are available.
 
-- Čekáme **2 minuty** po RFQ.
-- Jednou se připomeneme.
-- Čekáme další **2 minuty**.
-- Označíme jako **No response**.
+Testing settings:
 
-### Minimální odpovědi pro pokračování
+* Wait **2 minutes** after sending the RFQ.
+* Send one reminder.
+* Wait another **2 minutes**.
+* Mark the supplier as **No Response**.
 
-- Máme-li všechny odpovědi, pokračujeme srovnáváním nabídek.
-- Pokud nejsou všechny odpovědi, pokračujem pokud buď:
-  - Obdrželi jsme alespoň 2 nabídky, nebo
-  - Deadline pro RFQ vyprší.
-- Pokud je jen 1 nabídka, pokračujeme, ale případ je označen jako **Limited competition**.
-- Pokud nemáme nabídku, předáme to Ele.
+### Minimum Responses Required to Continue
 
-## 3\. Validace odpovědi
+* If all suppliers have responded, continue to offer comparison.
+* If not all suppliers have responded, continue when either:
 
-Dodavatelova odpověď je považována za validní, pokud:
+  * at least two valid offers have been received; or
+  * the RFQ deadline has expired.
+* If only one valid offer is available, continue but mark the case as **Limited Competition**.
+* If no valid offer is available, escalate the case to Ela.
 
-- Cena za jednotku je jasně udána
-- Měna je v USD nebo tak může být bezpečně interpretována
-- Dodavatel je spojen s vvyjednávacím případem
-- Zpráva není nejasná
+## 3. Response Validation
 
-Pokud je odpověď nejasná, AI system pošle jednu zprávu požadující upřesnění.
+A supplier response is considered a valid offer when:
 
-Příklady vyžadující upřesnění:
+* a clear unit price is provided;
+* the currency is USD or can be interpreted safely as USD;
+* the supplier is associated with the negotiation case;
+* the message is not materially ambiguous.
 
-- Několik cen v jedné zprávě.
-- Dodavatel položí otázku namísto odeslání nabídky
-- Dodavatel změní specifikaci požadované položky
+If the response is unclear, the system sends one message requesting clarification.
 
-Pokud stale nejasné, předáme Ele.
+Examples requiring clarification include:
 
-## 4\. Srovnání nabídek
+* several prices in one message without a clear distinction;
+* a total price without a clear unit price;
+* missing or unclear currency;
+* the supplier asking a question instead of providing an offer;
+* the supplier changing the requested item specification;
+* a conditional price whose conditions are unclear.
 
-Jakmile shromáždíme validní nabídky:
+If the response remains unclear after one clarification attempt, escalate it to Ela.
 
-- Systém určí nejlepší aktuální nabídku
-- Systém nastaví cílovou částku jako:
+## 4. Provisional Supplier Prices
 
-- **Cílová částka = 90% nejlepší nabídkuy**
+A price is provisional when the supplier indicates that it is tentative, estimated, subject to confirmation, or still being checked.
 
-- Systém uchovává:
-  - Nejlepší aktuální nabídku
-  - Cílovou částku
-  - Nabídky všech dodavatelů
+Examples include:
 
-## 5\. Vyjednávací fáze
+* “I am almost sure the price is USD 20.”
+* “The price should be around USD 20, but I need to confirm.”
+* “I will check with my supervisor, but it is probably USD 20.”
 
-- Systém vyjednává s jednotlivými dodavateli.
-- Systém neodhaluje jména jiných dodavatelů
-- Systém může říkat, že má lepší nabídky
-- Systém se ptá dodavatelů, zda se mohou dostat na cílovou částku, nebo aspoň blíže.
-- Každý dodavatel může obdržet nejvýše **2 vyjednávací zprávy** po obdržení první nabídky
-- Systém čeká na odpověď dodavatele, než pošle další vyjednávací zprávu.
-- Systém nesmí poslat opakovaně zprávy když čeká na odpověď.
+When a provisional price is received:
 
-Tón zpráv
+1. Store it as a **provisional offer**.
+2. Preserve the original supplier message.
+3. Exclude the provisional offer from:
 
-- Zdvořilý, přímý, stručný, profesionální, neagresivní, bez zmínění AI
+   * the minimum valid-offer count;
+   * offer comparison;
+   * supplier ranking;
+   * target-price calculation;
+   * winner selection.
+4. Send one short acknowledgement and wait for confirmation.
+5. Do not repeatedly acknowledge or follow up while waiting for the supplier.
+6. A contextual confirmation such as “Confirmed” or “Yes, confirmed” confirms the stored provisional price.
+7. A later explicit confirmed price supersedes the provisional price.
+8. The confirmed price becomes an active offer and may be used in comparison and negotiation.
+9. The earlier provisional record should remain available for history or be marked as superseded.
+10. If the supplier’s confirmation remains unclear, request one clarification and then escalate to Ela if necessary.
 
-Příklad formulace:
+A provisional offer must not be treated as **No Offer** while the system is actively waiting for confirmation. However, if the applicable deadline expires without confirmation and no other valid offer exists, the normal no-valid-offer escalation rules apply.
 
-Thank you for the offer. We are still above the level we need for this item. Could you please check whether there is room to get closer to USD X?
+## 5. Initial Offer Comparison
 
-## 6\. Reakce dodavatelů během vyjednávání
+Once valid confirmed offers have been collected:
 
-### Dodavatel souhlasí s cílovou částkou nebo nižší
+* The system identifies the current best offer.
+* The system calculates the target price as:
 
-- Dodavatel se stane kandidátem na vítěze
-- Ela potvrdí nebo odmítne.
+**Target price = 90% of the current best offer**
 
-### Dodavatel vylepší nabídku, ale stale je vyšší než cílová částka
+The system stores:
 
-- Systém uloží vylepšenou nabídku.
-- Pokud nám zbývají vyjednávací pokusy (neodeslali jsme maximální povolený počet vyjednávacích zpráv) system dale vyjednává směrem k cílové částce.
-- Pokud již nejsou vyjednávací pokusy, dodavatelova nejlepší nabídka je uložena pro závěrečné zhodnocení nabídek.
+* the current best offer;
+* the target price;
+* all confirmed supplier offers;
+* the current ranking.
 
-### Dodavatel odmítne nižší cenu
+Provisional offers must not be included in these calculations.
 
-- Systém zaznačí odmítnutí
-- Pokud zbývají vyjednávací pokusy, system pošle další vyjednávací zprávu.
-- Pokud jsou vyjednávací pokusy vyčerpány, dodaatelova nabídka je uložena pro závěrečné zhodnocení
+## 6. Negotiation Stage
 
-### Dodavatel neodpoví během vyjednávání
+* The system negotiates separately with each supplier.
+* The system must not reveal the names of competing suppliers.
+* The system may state that better market offers are available.
+* The system asks whether the supplier can reach the target price or move closer to it.
+* Each supplier may receive no more than **two negotiation messages** after submitting the first valid confirmed offer.
+* The system must wait for the supplier’s response before sending another negotiation message.
+* The system must not repeatedly send messages while waiting for a response.
 
-Navrhované nastavení
+### Message Tone
 
-- Čekáme **1 pracovní den**.
-- Pošleme jedno krátké připomenutí
-- Čekáme další pracovní den
-- Pokud stale nic, dodavatelova poslední nabídka je konečná
+Messages must be:
 
-Testovací nastavení:
+* polite;
+* direct;
+* concise;
+* professional;
+* non-aggressive;
+* written without mentioning AI or automation.
 
-- čekáme **2 minuty**.
-- Pošleme připomenutí.
-- Čekáme další 2 minuty
-- Pokud stale bez odpovědi, použijeme poslední nabídku jako konečnou
+Example:
 
-## 7\. Když nikdo nepřistoupí na cílovou částku
+> Thank you for the offer. We are still above the level we need for this item. Could you please check whether there is room to get closer to USD X?
 
-Pokud nikdo nepřistoupí na cílovou částku po vyčerpání vyjednávacích pokusů:
+## 7. Supplier Responses During Negotiation
 
-- Systém srovná konečné nabídky
-- Systém vybere nejnižší finální nabídku.
-- Pokud je nejnižší finální nabídka v rámci tolerance, přijmeme a navrhneme vítěze
-- Jinak dame k řešení Ele
+### Supplier Accepts the Target Price or a Lower Price
 
-Pravidlo tolerance:
+* The supplier becomes a candidate for winner selection.
+* Ela confirms or rejects the proposed winner.
 
-- Pokud je nejnižší Konečná nabídka do **5% nad cílovou částku**, system doporučí její přijetí
-- Pokud je nad **5% cílové částky**, dame k řešení Ele
+### Supplier Improves the Offer but Remains Above the Target
 
-## 8\. Označení vítěze
+* Store the improved offer.
+* If negotiation attempts remain, continue negotiating toward the target price.
+* If no attempts remain, store the supplier’s best offer for final evaluation.
 
-- Jako vítěz je ozačen:
-  - Dodavatel souhlasí s cílovou částkou nebo nižší
-  - Dodavatel s nejnižší přijatelnou konečnou nabídkou, nebo
-  - Elou manuálně označený dodavatel
-- Ne-vítězové nejsou automaticky informováni, pouze pokud to Ela rozhodne
+### Supplier Refuses to Reduce the Price
 
-## 9\. Témata, o kterých se nevyjednává (zatím)
+* Record the refusal.
+* If negotiation attempts remain, the system may send another negotiation message.
+* If all attempts have been used, store the supplier’s best offer for final evaluation.
 
-- Platební podmínky
-- záloha
-- cash platba
-- zpoždění dodávky
-- změna specifikace
-- stížnost na kvalitu
-- odmítnutí dodávky
-- vrácení na náklady dodavatele
-- …
+### Supplier Does Not Respond During Negotiation
 
-Pro tato témata:
+Production settings:
 
-- Systém uloží zprávu.
-- Systém klasifikuje téma.
-- Systém pozastaví automatické vyjadnávání pro tohoto dodavatele.
-- Systém vytvoří případ pro zhodnocení Elou
-- System může navrhnout odpověď, ale nesmí automaticky odeslat.
+* Wait **1 business day**.
+* Send one short reminder.
+* Wait another business day.
+* If there is still no response, use the supplier’s latest valid confirmed offer as the final offer.
 
-## 10\. Neznámý typ konvrezace
+Testing settings:
 
-Pokud dodavatel pošle zprávu, kterou nelze zařadit do žádné kategorie:
+* Wait **2 minutes**.
+* Send one reminder.
+* Wait another **2 minutes**.
+* If there is still no response, use the latest valid confirmed offer as the final offer.
 
-Klasifikujeme jako **Unknown / Needs review**.
+The system must not send another negotiation message before the supplier replies or the applicable reminder deadline is reached.
 
-- Zastavíme automatické vyjednávání pro dodavatele
-- Uložíme konverzaci.
-- Notifikujeme Elu.
-- Neposíláme automatické odpověfi.
+## 8. When No Supplier Accepts the Target Price
 
-## 11\. Počáteční automatatizace
+If no supplier accepts the target price after all negotiation attempts have been exhausted:
 
-Bezpečné pro automatické řešení jsou:
+* Compare all final confirmed offers.
+* Identify the lowest final offer.
+* If the lowest final offer is within the permitted tolerance, recommend accepting it and propose the supplier as the winner.
+* Otherwise, escalate the decision to Ela.
 
-- RFQ odeslání
-- RFQ připomenutí
-- Extrakce ceny
-- Srovnání ceny
-- Požadavek na snížení ceny
-- Ukládání vylepšených nabídek
-- Ohodnocení dodavatelů
-- Návrh vítěze
+### Tolerance Rule
 
-Co potřebuje potvrzení Ely:
+* If the lowest final offer is no more than **5% above the target price**, recommend acceptance.
+* If it is more than **5% above the target price**, escalate the case to Ela.
 
-- Potvrzení nákupu
-- Dohodnutí platebních podmínek
-- Příjem zálohy
-- Diskuse o kvalitě
-- Odmítnutí zboží
-- Vrácení na náklady dodavatele
-- Neznámé typy konverzace
-- Akceptování vyšší ceny než toleracne
+## 9. Winner Selection
 
-## 12\. Navrhované hodnoty pro strategii
+A supplier may be selected as the winner when:
 
-- RFQ připomenutí po: **1 pracovní den**
-- RFQ uzavření bez odpovědi po: **2 pracovní dny**
-- Cílová částka: **Nejlepší nabídka mínus 10%**
-- Maximální počet vyjednávacích pokusů pro dodavatele: **2**
-- Vyjednávací followup po: **1 praconví den**
-- Maximální počet AI zpráv bez odpovědi dodavatele:: **2**
-- Přijatelná tolerance nad cílovou částku: **5%**
-- Notifikace vítěze: **Vyžaduje vždy zásah Ely**
+* the supplier accepts the target price or a lower price;
+* the supplier has the lowest acceptable final offer; or
+* Ela manually selects the supplier.
 
-Testování:
+Winner notification always requires Ela’s approval.
 
-- RFQ připomenutí po: **2 min**
-- RFQ uzavření bez odpovědi po: **4 min**
-- Cílová částka: **Nejlepší nabídka mínus 10%**
-- Maximální počet vyjednávacích pokusů pro dodavatele: **2**
-- Vyjednávací followup po: **2 min**
-- Maximální počet AI zpráv bez odpovědi dodavatele:: **2**
-- Přijatelná tolerance nad cílovou částku: **5%**
-- Notifikace vítěze: simulace
+Non-winning suppliers are not automatically informed unless Ela explicitly decides to notify them.
+
+## 10. Topics Not Negotiated Automatically
+
+The system does not currently negotiate or decide matters concerning:
+
+* payment terms;
+* deposits;
+* cash payments;
+* delivery delays;
+* changes to the requested specification;
+* quality complaints;
+* rejection of delivered goods;
+* returns at the supplier’s expense;
+* legal or compliance matters;
+* exclusivity;
+* disputes;
+* other non-price commercial terms.
+
+For these topics:
+
+1. Store the supplier’s message.
+2. Classify the topic.
+3. Pause automatic negotiation for that supplier.
+4. Create a human-review item for Ela.
+5. The system may suggest a draft reply.
+6. The system must not send the reply automatically.
+
+## 11. Unknown Conversation Type
+
+If a supplier sends a message that cannot be classified reliably, classify it as:
+
+**Unknown / Needs Review**
+
+Then:
+
+* pause automatic negotiation for the supplier;
+* store the full conversation;
+* notify Ela;
+* create a human-review item;
+* do not send an automatic response.
+
+## 12. Initial Automation Scope
+
+The following actions are considered safe for automatic processing:
+
+* sending RFQs;
+* sending RFQ reminders;
+* extracting prices;
+* validating prices;
+* storing provisional offers;
+* acknowledging provisional offers once;
+* converting clearly confirmed provisional offers into confirmed offers;
+* comparing confirmed prices;
+* requesting a price reduction;
+* storing improved offers;
+* evaluating and ranking suppliers;
+* proposing a winner.
+
+The following actions require Ela’s confirmation or intervention:
+
+* confirming the purchase;
+* notifying the winner;
+* agreeing to payment terms;
+* accepting or requesting a deposit;
+* discussing quality matters;
+* rejecting goods;
+* arranging returns at the supplier’s expense;
+* handling unknown conversation types;
+* accepting a price above the permitted tolerance;
+* handling unusual or unsupported commercial topics.
+
+## 13. Recommended Strategy Values
+
+### Production Settings
+
+* RFQ reminder after: **1 business day**
+* RFQ closed without response after: **2 business days**
+* Target price: **10% below the best confirmed offer**
+* Maximum negotiation messages per supplier: **2**
+* Negotiation follow-up after: **1 business day**
+* Maximum AI messages without a supplier response: **2**
+* Acceptable tolerance above target price: **5%**
+* Winner notification: **Always requires Ela’s action**
+
+### Testing Settings
+
+* RFQ reminder after: **2 minutes**
+* RFQ closed without response after: **4 minutes**
+* Target price: **10% below the best confirmed offer**
+* Maximum negotiation messages per supplier: **2**
+* Negotiation follow-up after: **2 minutes**
+* Maximum AI messages without a supplier response: **2**
+* Acceptable tolerance above target price: **5%**
+* Winner notification: **Simulated or manually confirmed**
