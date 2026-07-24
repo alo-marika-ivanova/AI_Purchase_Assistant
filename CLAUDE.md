@@ -148,6 +148,19 @@ When changing state logic:
 * do not send another negotiation message while waiting for a reply;
 * preserve terminal states and human-review behavior.
 
+### Negotiation-reply interpretation is LLM-authoritative
+
+For a supplier reply received during negotiation (`app/services/negotiation_reply_service.py`), the LLM classification returned by `analyze_supplier_message_with_ollama` is authoritative for message interpretation: message category, extracted price, risk-topic detection, and whether the reply requires human review.
+
+`app/negotiation/common_reply_policy.py` (`decide_common_negotiation_reply`) does not re-derive or override a usable LLM result from the raw text. It is a deterministic fallback only, used exclusively when the LLM result itself is unusable:
+
+* the LLM call failed; or
+* the LLM recommended saving an offer but returned no usable unit price.
+
+In those fallback cases only, a conservative regex scan tries to recover exactly one explicit price from the raw text; anything less conclusive still escalates to human review.
+
+Deterministic Python code still owns everything outside message interpretation: state transitions, deadlines, retry limits, target-price calculation, the price-can't-increase check in `negotiation_reply_service.py`, and winner approval. Do not reintroduce an independent regex-based override of a successful LLM classification for negotiation replies.
+
 ## LLM provider
 
 The current implementation uses local Ollama in:

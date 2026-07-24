@@ -16,11 +16,14 @@ DecisionAction = Literal[
 @dataclass(frozen=True)
 class CommonNegotiationDecision:
     """
-    Conservative deterministic interpretation of common negotiation replies.
+    Deterministic fallback for negotiation replies.
 
-    The LLM remains the primary semantic interpreter. This policy layer only
-    overrides it when the supplier text contains a common, objectively
-    verifiable price pattern or a common risk indicator.
+    The LLM classification is authoritative for message interpretation,
+    price extraction, and human-review triggering. This policy layer is
+    only consulted when the LLM result itself is unusable: the LLM call
+    failed, or it recommended saving an offer without returning a usable
+    price. In that case a conservative regex scan of the raw text is used
+    to try to recover a single explicit price.
     """
 
     action: DecisionAction
@@ -84,49 +87,6 @@ _COMMON_PRICE_LANGUAGE_PATTERN = re.compile(
     r"we\s+can\s+do|can\s+do|accept)\b",
     re.IGNORECASE,
 )
-
-_TOTAL_OR_RANGE_PATTERN = re.compile(
-    r"\b(?:total|altogether|for\s+all|range|between|from)\b",
-    re.IGNORECASE,
-)
-
-_QUANTITY_TIER_PATTERN = re.compile(
-    r"\b(?:if|when|above|over|at\s+least|minimum|min\.?|"
-    r"more\s+than)\s+\d+\b",
-    re.IGNORECASE,
-)
-
-_COMMON_RISK_PATTERN = re.compile(
-    r"\b(?:"
-    r"deposit|prepayment|pre-payment|payment\s+term|"
-    r"pay\s+in\s+advance|advance\s+payment|cash\s+payment|"
-    r"delivery|lead\s+time|ship(?:ping)?|"
-    r"specification|specifications|different\s+material|"
-    r"alternative\s+material|quality|certificate|certification|"
-    r"return|refund|reject(?:ion|ed)?|"
-    r"legal|liability|contract|penalty|"
-    r"customs|sanction|compliance|"
-    r"confidential|confidentiality|exclusive|exclusivity|"
-    r"dispute|claim|"
-    r"call\s+me|phone\s+me|telephone|video\s+call"
-    r")\b",
-    re.IGNORECASE,
-)
-
-_RISKY_LLM_CATEGORIES = {
-    "PAYMENT_TERMS",
-    "DEPOSIT_OR_PREPAYMENT",
-    "CASH_PAYMENT",
-    "DELIVERY_ISSUE",
-    "CHANGED_SPECIFICATION",
-    "QUALITY_ISSUE",
-    "RETURN_OR_REJECTION",
-    "LEGAL_OR_LIABILITY",
-    "CUSTOMS_OR_COMPLIANCE",
-    "CONFIDENTIALITY_OR_EXCLUSIVITY",
-    "SUPPLIER_DISPUTE",
-    "UNKNOWN",
-}
 
 _PRICE_TOLERANCE = 0.005
 
@@ -205,150 +165,103 @@ def decide_common_negotiation_reply(
     target_price_usd: float | None,
 ) -> CommonNegotiationDecision:
     """
-    Apply safe deterministic invariants to a negotiation reply.
+    Deterministic fallback for a negotiation reply.
 
-    Priority:
-    1. common risk or human-review signal -> review;
-    2. multiple/conditional/total prices -> review;
-    3. one clear explicit price -> compare numerically;
-    4. contextual target acceptance -> save target;
-    5. otherwise retain the classifier result.
+    The LLM classification (`analysis`) is authoritative for message
+    interpretation, price extraction, risk-topic detection, and
+    human-review triggering. This function does not re-derive any of
+    that from the raw text and must not override a usable LLM result.
+
+    It only takes over when the LLM result itself cannot be used:
+    - the LLM call failed; or
+    - the LLM recommended saving an offer but returned no usable price.
+
+    In either case, a conservative regex scan of the raw text is used to
+    try to recover exactly one explicit price. Anything less conclusive
+    escalates to human review.
     """
     text = (supplier_text or "").strip()
 
-    category = str(
-        analysis.get("message_category") or ""
-    ).strip().upper()
+    llm_succeeded = bool(analysis.get("success", True))
 
     classifier_action = str(
         analysis.get("recommended_action") or ""
     ).strip().upper()
 
-    requires_human_review = bool(
-        analysis.get("requires_human_review")
+    needs_price_but_missing = (
+        classifier_action
+        in {"SAVE_OFFER", "SAVE_PROVISIONAL_OFFER_AND_WAIT"}
+        and analysis.get("unit_price_usd") is None
     )
 
-    safe_for_automation = analysis.get(
-        "safe_for_automation"
-    )
-
-    if (
-        _COMMON_RISK_PATTERN.search(text)
-        or category in _RISKY_LLM_CATEGORIES
-        or requires_human_review
-        or safe_for_automation is False
-        or classifier_action == "PAUSE_FOR_REVIEW"
-    ):
+    if llm_succeeded and not needs_price_but_missing:
         return CommonNegotiationDecision(
-            action="PAUSE_FOR_REVIEW",
+            action="USE_CLASSIFIER_RESULT",
             unit_price_usd=None,
-            reason=(
-                "The reply contains a common commercial-risk or "
-                "human-review signal."
-            ),
-        )
-
-    if (
-        bool(analysis.get("has_multiple_prices"))
-        or bool(analysis.get("is_conditional"))
-        or str(analysis.get("price_basis") or "").upper()
-        in {"TOTAL", "RANGE"}
-        or _TOTAL_OR_RANGE_PATTERN.search(text)
-        or _QUANTITY_TIER_PATTERN.search(text)
-    ):
-        return CommonNegotiationDecision(
-            action="PAUSE_FOR_REVIEW",
-            unit_price_usd=None,
-            reason=(
-                "The reply contains multiple, total, range, or "
-                "quantity-dependent pricing."
-            ),
+            reason="The LLM classification is authoritative and usable.",
         )
 
     prices = extract_common_explicit_prices(text)
 
-    if len(prices) > 1:
+    if len(prices) != 1:
         return CommonNegotiationDecision(
             action="PAUSE_FOR_REVIEW",
             unit_price_usd=None,
             reason=(
-                "More than one distinct explicit price was found."
+                "The LLM result was unusable and the deterministic "
+                "fallback could not find exactly one explicit price."
             ),
         )
 
-    if len(prices) == 1:
-        price = prices[0]
+    price = prices[0]
 
-        if price <= 0:
-            return CommonNegotiationDecision(
-                action="PAUSE_FOR_REVIEW",
-                unit_price_usd=None,
-                reason="The extracted price is not positive.",
-            )
-
-        if previous_best_price_usd is None:
-            return CommonNegotiationDecision(
-                action="SAVE_OFFER",
-                unit_price_usd=price,
-                reason=(
-                    "One clear explicit unit price was found."
-                ),
-            )
-
-        previous = float(previous_best_price_usd)
-
-        if price < previous - _PRICE_TOLERANCE:
-            return CommonNegotiationDecision(
-                action="SAVE_OFFER",
-                unit_price_usd=price,
-                reason=(
-                    f"The supplier explicitly improved the price "
-                    f"from USD {previous:.2f} to USD {price:.2f}."
-                ),
-            )
-
-        if abs(price - previous) <= _PRICE_TOLERANCE:
-            return CommonNegotiationDecision(
-                action="RECORD_PRICE_REFUSAL",
-                unit_price_usd=previous,
-                reason=(
-                    f"The supplier repeated the existing best price "
-                    f"of USD {previous:.2f}."
-                ),
-            )
-
+    if price <= 0:
         return CommonNegotiationDecision(
             action="PAUSE_FOR_REVIEW",
             unit_price_usd=None,
-            reason=(
-                f"The supplier stated USD {price:.2f}, above the "
-                f"previous best price of USD {previous:.2f}."
-            ),
+            reason="The fallback-extracted price is not positive.",
         )
 
-    supplier_accepts_target = bool(
-        analysis.get("supplier_accepts_target")
-    )
-
-    if (
-        supplier_accepts_target
-        and target_price_usd is not None
-    ):
-        target = float(target_price_usd)
-
+    if previous_best_price_usd is None:
         return CommonNegotiationDecision(
             action="SAVE_OFFER",
-            unit_price_usd=target,
+            unit_price_usd=price,
             reason=(
-                "The supplier contextually accepted the explicit "
-                f"target price of USD {target:.2f}."
+                "The LLM result was unusable; fallback extraction found "
+                "one clear explicit unit price."
+            ),
+        )
+
+    previous = float(previous_best_price_usd)
+
+    if price < previous - _PRICE_TOLERANCE:
+        return CommonNegotiationDecision(
+            action="SAVE_OFFER",
+            unit_price_usd=price,
+            reason=(
+                f"The LLM result was unusable; fallback extraction found "
+                f"an improved price from USD {previous:.2f} to "
+                f"USD {price:.2f}."
+            ),
+        )
+
+    if abs(price - previous) <= _PRICE_TOLERANCE:
+        return CommonNegotiationDecision(
+            action="RECORD_PRICE_REFUSAL",
+            unit_price_usd=previous,
+            reason=(
+                f"The LLM result was unusable; fallback extraction found "
+                f"the supplier repeating the existing best price of "
+                f"USD {previous:.2f}."
             ),
         )
 
     return CommonNegotiationDecision(
-        action="USE_CLASSIFIER_RESULT",
+        action="PAUSE_FOR_REVIEW",
         unit_price_usd=None,
         reason=(
-            "No conservative deterministic override applies."
+            f"The LLM result was unusable; fallback extraction found "
+            f"USD {price:.2f}, above the previous best price of "
+            f"USD {previous:.2f}."
         ),
     )
