@@ -14,6 +14,7 @@ from app.negotiation.common_reply_policy import (
 
 
 BASE_ANALYSIS = {
+    "success": True,
     "message_category": "GENERAL_NON_PRICE",
     "recommended_action": "PAUSE_FOR_REVIEW",
     "safe_for_automation": True,
@@ -27,26 +28,58 @@ BASE_ANALYSIS = {
 
 TESTS = [
     {
-        "name": "improved final offer overrides refusal",
-        "text": "I can go to 39 USD, but that's my final offer.",
-        "analysis": {
-            **BASE_ANALYSIS,
-            "message_category": "PRICE_REFUSAL",
-            "recommended_action": "RECORD_PRICE_REFUSAL",
-        },
-        "previous": 42.0,
-        "target": 36.0,
-        "expected_action": "SAVE_OFFER",
-        "expected_price": 39.0,
-    },
-    {
-        "name": "ordinary improved price",
-        "text": "We can reduce the price to 38 per unit.",
+        "name": "usable LLM result is authoritative despite two numbers in text",
+        "text": "Absolutely impossible to go to 27 usd. We could go to 28.50 usd.",
         "analysis": {
             **BASE_ANALYSIS,
             "message_category": "IMPROVED_PRICE_OFFER",
             "recommended_action": "SAVE_OFFER",
-            "unit_price_usd": 38.0,
+            "unit_price_usd": 28.50,
+        },
+        "previous": 30.0,
+        "target": 27.0,
+        "expected_action": "USE_CLASSIFIER_RESULT",
+        "expected_price": None,
+    },
+    {
+        "name": "usable LLM risk classification is trusted, no regex recheck",
+        "text": "We can do 36 USD, but only with a 50 percent deposit.",
+        "analysis": {
+            **BASE_ANALYSIS,
+            "message_category": "DEPOSIT_OR_PREPAYMENT",
+            "recommended_action": "PAUSE_FOR_REVIEW",
+            "requires_human_review": True,
+            "safe_for_automation": False,
+        },
+        "previous": 42.0,
+        "target": 36.0,
+        "expected_action": "USE_CLASSIFIER_RESULT",
+        "expected_price": None,
+    },
+    {
+        "name": "contextual target acceptance is trusted from the LLM",
+        "text": "Yes, we can do that.",
+        "analysis": {
+            **BASE_ANALYSIS,
+            "message_category": "TARGET_ACCEPTANCE",
+            "recommended_action": "SAVE_OFFER",
+            "unit_price_usd": 36.0,
+            "supplier_accepts_target": True,
+        },
+        "previous": 42.0,
+        "target": 36.0,
+        "expected_action": "USE_CLASSIFIER_RESULT",
+        "expected_price": None,
+    },
+    {
+        "name": "failed LLM call falls back to one extracted price",
+        "text": "We can do 38 USD.",
+        "analysis": {
+            **BASE_ANALYSIS,
+            "success": False,
+            "message_category": "UNKNOWN",
+            "recommended_action": "PAUSE_FOR_REVIEW",
+            "requires_human_review": True,
         },
         "previous": 42.0,
         "target": 36.0,
@@ -54,43 +87,14 @@ TESTS = [
         "expected_price": 38.0,
     },
     {
-        "name": "unchanged final price",
-        "text": "No, 42 USD is our final price.",
+        "name": "failed LLM call with ambiguous text still pauses",
+        "text": "We can do 40 USD, or 38 USD above 100 pieces.",
         "analysis": {
             **BASE_ANALYSIS,
-            "message_category": "PRICE_REFUSAL",
-            "recommended_action": "RECORD_PRICE_REFUSAL",
-        },
-        "previous": 42.0,
-        "target": 36.0,
-        "expected_action": "RECORD_PRICE_REFUSAL",
-        "expected_price": 42.0,
-    },
-    {
-        "name": "contextual target acceptance",
-        "text": "Yes, we can do that.",
-        "analysis": {
-            **BASE_ANALYSIS,
-            "message_category": "TARGET_ACCEPTANCE",
-            "recommended_action": "SAVE_OFFER",
-            "supplier_accepts_target": True,
-        },
-        "previous": 42.0,
-        "target": 36.0,
-        "expected_action": "SAVE_OFFER",
-        "expected_price": 36.0,
-    },
-    {
-        "name": "deposit condition pauses",
-        "text": (
-            "We can do 36 USD, but only with a "
-            "50 percent deposit."
-        ),
-        "analysis": {
-            **BASE_ANALYSIS,
-            "message_category": "CONDITIONAL_PRICE",
-            "recommended_action": "ASK_PRICE_CLARIFICATION",
-            "is_conditional": True,
+            "success": False,
+            "message_category": "UNKNOWN",
+            "recommended_action": "PAUSE_FOR_REVIEW",
+            "requires_human_review": True,
         },
         "previous": 42.0,
         "target": 36.0,
@@ -98,44 +102,25 @@ TESTS = [
         "expected_price": None,
     },
     {
-        "name": "two prices pause",
-        "text": (
-            "We can do 40 USD, or 38 USD above "
-            "100 pieces."
-        ),
-        "analysis": {
-            **BASE_ANALYSIS,
-            "message_category": "MULTIPLE_PRICES",
-            "recommended_action": "ASK_PRICE_CLARIFICATION",
-            "has_multiple_prices": True,
-        },
-        "previous": 42.0,
-        "target": 36.0,
-        "expected_action": "PAUSE_FOR_REVIEW",
-        "expected_price": None,
-    },
-    {
-        "name": "price increase pauses",
-        "text": "Our final price is 45 USD.",
+        "name": "SAVE_OFFER missing a price falls back to extraction",
+        "text": "We can reduce the price to 38 per unit.",
         "analysis": {
             **BASE_ANALYSIS,
             "message_category": "CLEAR_PRICE_OFFER",
             "recommended_action": "SAVE_OFFER",
-            "unit_price_usd": 45.0,
+            "unit_price_usd": None,
         },
         "previous": 42.0,
         "target": 36.0,
-        "expected_action": "PAUSE_FOR_REVIEW",
-        "expected_price": None,
+        "expected_action": "SAVE_OFFER",
+        "expected_price": 38.0,
     },
     {
-        "name": "reply later remains classifier decision",
+        "name": "reply-later stays a classifier decision",
         "text": "We will check and reply tomorrow.",
         "analysis": {
             **BASE_ANALYSIS,
-            "message_category": (
-                "ACKNOWLEDGEMENT_WILL_REPLY"
-            ),
+            "message_category": "ACKNOWLEDGEMENT_WILL_REPLY",
             "recommended_action": "WAIT_FOR_SUPPLIER",
         },
         "previous": 42.0,
