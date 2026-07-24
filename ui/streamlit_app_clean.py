@@ -42,6 +42,40 @@ st.set_page_config(
 initialize_database()
 repo = PurchasingRepository()
 
+_OUTBOX_STATUS_LABELS = {
+    "pending": "Queued",
+    "processing": "Sending...",
+    "sent": "Sent",
+    "simulated": "Sent (simulated)",
+    "transient_failure": "Retrying (temporary delivery failure)",
+    "permanent_failure": "Failed - see human review",
+    "delivery_unknown": "Delivery unknown - see human review",
+}
+
+
+def _describe_outbound_message_status(msg: dict) -> str:
+    """Return a buyer-facing status label for one outbound message.
+
+    Outbound email/WhatsApp messages are tracked in the transport outbox;
+    show that status when available, since it reflects the real delivery
+    state (including a pending automatic retry), not just the outcome of
+    the very first attempt recorded on the messages row. Falls back to the
+    raw message status for manual/simulated messages, which never get an
+    outbox job.
+    """
+    if msg.get("direction") != "outbound" or msg.get("channel") not in (
+        "email",
+        "whatsapp",
+    ):
+        return msg.get("status") or ""
+
+    outbox_job = repo.get_outbox_status_for_message(int(msg["id"]))
+
+    if outbox_job is None:
+        return msg.get("status") or ""
+
+    return _OUTBOX_STATUS_LABELS.get(outbox_job["status"], outbox_job["status"])
+
 
 # ---------------------------------------------------------------------
 # Case creation dialog
@@ -574,7 +608,7 @@ with main_col:
                 is_buyer = msg["direction"] == "outbound"
 
                 speaker = "Buyer/system" if is_buyer else selected_supplier["name"]
-                status = msg.get("status")
+                status = _describe_outbound_message_status(msg)
                 message_type = msg.get("message_type") or "general"
                 created_at = msg.get("created_at")
 
@@ -627,12 +661,36 @@ with main_col:
                     )
 
                     send_result = result.get("send_result")
+                    outcome = (
+                        send_result.get("delivery_outcome")
+                        if send_result is not None
+                        else None
+                    )
 
-                    if send_result is not None and not send_result.get("success"):
-                        st.error(send_result.get("error") or "Message sending failed.")
+                    if send_result is None or outcome in ("sent", "dry_run"):
+                        st.success("Buyer message sent.")
+                    elif outcome == "transient":
+                        st.warning(
+                            "Message queued. The first delivery attempt failed "
+                            "temporarily; the transport worker will retry it "
+                            "automatically."
+                        )
+                    elif outcome == "permanent":
+                        st.error(
+                            "Message could not be delivered: "
+                            f"{send_result.get('error') or 'permanent failure'}. "
+                            "See human review."
+                        )
+                    elif outcome == "unknown":
+                        st.warning(
+                            "Delivery status is unknown after a timeout or "
+                            "connection loss. It was not retried automatically "
+                            "to avoid a duplicate send. See human review."
+                        )
                     else:
-                        st.success("Buyer message created.")
-                        st.rerun()
+                        st.error(send_result.get("error") or "Message sending failed.")
+
+                    st.rerun()
 
                 except Exception as exc:
                     st.error(str(exc))
@@ -815,14 +873,42 @@ with main_col:
                         )
 
                         send_result = result.get("send_result")
+                        outcome = (
+                            send_result.get("delivery_outcome")
+                            if send_result is not None
+                            else None
+                        )
+                        winner_name = result["winner_supplier"]["name"]
 
-                        if send_result and not send_result.get("success"):
-                            st.error(send_result.get("error"))
-                        else:
+                        if send_result is None or outcome in ("sent", "dry_run"):
                             st.success(
-                                f"Winner notification generated for "
-                                f"{result['winner_supplier']['name']}."
+                                f"Winner notification sent to {winner_name}."
                             )
+                        elif outcome == "transient":
+                            st.warning(
+                                f"Winner notification for {winner_name} is "
+                                "queued. The first delivery attempt failed "
+                                "temporarily; the transport worker will retry "
+                                "it automatically. The case will move to "
+                                "Winner Notified once delivery succeeds."
+                            )
+                        elif outcome == "permanent":
+                            st.error(
+                                f"Winner notification for {winner_name} could "
+                                f"not be delivered: "
+                                f"{send_result.get('error') or 'permanent failure'}. "
+                                "See human review."
+                            )
+                        elif outcome == "unknown":
+                            st.warning(
+                                f"Delivery status for the winner notification "
+                                f"to {winner_name} is unknown after a timeout "
+                                "or connection loss. It was not retried "
+                                "automatically to avoid a duplicate send. See "
+                                "human review."
+                            )
+                        else:
+                            st.error(send_result.get("error") or "Message sending failed.")
 
                         st.rerun()
 

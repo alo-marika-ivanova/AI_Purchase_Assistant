@@ -206,6 +206,47 @@ CREATE TABLE IF NOT EXISTS whatsapp_imports (
     FOREIGN KEY (message_id) REFERENCES messages(id)
 );
 
+-- Staging table for inbound WhatsApp webhook events. The webhook inserts a
+-- row here and returns immediately; classification, case routing, and
+-- negotiation processing happen later (transport worker poll, or a
+-- background task triggered right after the response is sent), not in the
+-- webhook request itself. whatsapp_imports (above) remains the durable
+-- record of a successfully processed inbound WhatsApp message, written once
+-- processing completes.
+CREATE TABLE IF NOT EXISTS whatsapp_inbound_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    wa_message_id TEXT NOT NULL UNIQUE,
+    sender_phone TEXT NOT NULL,
+    body TEXT NOT NULL,
+    received_at TEXT,
+
+    -- failed also covers "processing was interrupted by a crash/restart":
+    -- reprocessing is not safe to do automatically (record_supplier_message_simple
+    -- is not idempotent), so an abandoned event is surfaced for manual
+    -- review rather than silently retried.
+    status TEXT NOT NULL DEFAULT 'received'
+        CHECK (status IN ('received', 'processing', 'processed', 'failed')),
+
+    case_id INTEGER,
+    supplier_id INTEGER,
+    message_id INTEGER,
+    error TEXT,
+
+    locked_at TEXT,
+    locked_by TEXT,
+
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    processed_at TEXT,
+
+    FOREIGN KEY(case_id) REFERENCES negotiation_cases(id) ON DELETE SET NULL,
+    FOREIGN KEY(supplier_id) REFERENCES suppliers(id) ON DELETE SET NULL,
+    FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_whatsapp_inbound_events_status
+ON whatsapp_inbound_events(status);
+
 CREATE TABLE IF NOT EXISTS negotiation_action_locks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     case_id INTEGER NOT NULL,
@@ -294,3 +335,56 @@ CREATE TABLE IF NOT EXISTS human_review_email_notifications (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (review_item_id) REFERENCES human_review_items(id) ON DELETE CASCADE
 );
+
+-- Transport outbox: one row per real outbound email/WhatsApp delivery job.
+-- The messages table remains the permanent conversation/audit record; the
+-- outbox tracks delivery attempts, retries, and provider outcomes for the
+-- message it references. No row is created for simulated-case messages
+-- (auto_send_messages = 0), since nothing is handed to a provider for those.
+CREATE TABLE IF NOT EXISTS transport_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    message_id INTEGER NOT NULL UNIQUE,
+    case_id INTEGER NOT NULL,
+    supplier_id INTEGER,
+
+    channel TEXT NOT NULL CHECK (channel IN ('email', 'whatsapp')),
+    idempotency_key TEXT NOT NULL UNIQUE,
+
+    -- simulated: the adapter itself ran in dry-run/test mode (EMAIL_DRY_RUN,
+    -- WHATSAPP_DRY_RUN), so no real provider call was made.
+    -- delivery_unknown: a timeout/connection loss made it impossible to tell
+    -- whether the provider accepted the message. Never auto-retried.
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN (
+            'pending',
+            'processing',
+            'sent',
+            'transient_failure',
+            'permanent_failure',
+            'delivery_unknown',
+            'simulated'
+        )),
+
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+
+    locked_at TEXT,
+    locked_by TEXT,
+
+    provider_message_id TEXT,
+    last_error TEXT,
+    failure_type TEXT
+        CHECK (failure_type IN ('transient', 'permanent', 'unknown') OR failure_type IS NULL),
+
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    sent_at TEXT,
+
+    FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+    FOREIGN KEY(case_id) REFERENCES negotiation_cases(id) ON DELETE CASCADE,
+    FOREIGN KEY(supplier_id) REFERENCES suppliers(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_transport_outbox_claim
+ON transport_outbox(status, next_attempt_at);

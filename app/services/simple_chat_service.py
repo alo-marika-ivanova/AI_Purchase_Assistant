@@ -6,14 +6,16 @@ from app.db.repository import PurchasingRepository
 from app.services.human_review_notification_service import (
     create_human_review_item_with_notification,
 )
-from app.integrations.email_adapter import send_email_message
 from app.llm.communication_writer import write_buyer_message
 from app.services.offer_service import add_offer
 from app.services.recommendation_service import get_offer_recommendation
 from app.services.negotiation_reply_service import (
     record_negotiation_supplier_message,
 )
-from app.integrations.whatsapp_adapter import send_whatsapp_text
+from app.services.transport_delivery_service import (
+    attempt_email_delivery,
+    attempt_whatsapp_delivery,
+)
 from app.negotiation.rfq_rules import RfqRuleAction, plan_rfq_stage_actions
 from app.negotiation.actions import NegotiationAction, NegotiationActionType
 from app.negotiation.negotiation_rules import plan_initial_target_price_actions
@@ -150,25 +152,18 @@ def _build_references(
     return " ".join(unique_parts)
 
 
-def _send_message_by_email(message_id: int) -> dict:
-    message = repo.get_message_by_id(message_id)
+def build_email_delivery_context(message: dict) -> dict:
+    """Build the subject/threading fields needed to (re)send one stored
+    outbound email message.
 
-    if message is None:
-        raise ValueError("Message not found.")
-
-    if message["direction"] != "outbound":
-        raise ValueError("Only outbound messages can be sent by email.")
-
-    if not message.get("email"):
-        repo.mark_message_send_failed(
-            message_id=message_id,
-            error="Supplier has no email address.",
-        )
-        return {
-            "success": False,
-            "error": "Supplier has no email address.",
-        }
-
+    Shared by the immediate first-attempt path (_send_message_by_email) and
+    the transport worker's later retry of the same message, so an outbound
+    email is sent with consistent threading headers regardless of which
+    attempt actually succeeds. Recomputed from the current thread state
+    each time it is called, rather than frozen at enqueue time; if a new
+    supplier reply arrives between the first attempt and a retry, a retry
+    reflects that newer thread state.
+    """
     case_data = repo.get_case_basic(int(message["case_id"]))
     if case_data is None:
         raise ValueError("Case not found.")
@@ -204,41 +199,44 @@ def _send_message_by_email(message_id: int) -> dict:
         # First RFQ starts a new thread.
         subject = base_subject
 
-    result = send_email_message(
-        to_email=message["email"],
-        subject=subject,
-        body=message["body"],
-        in_reply_to=in_reply_to,
-        references=references,
-    )
+    return {
+        "subject": subject,
+        "in_reply_to": in_reply_to,
+        "references": references,
+    }
 
-    if result["success"]:
-        repo.mark_message_sent_email(
-            message_id=message_id,
-            provider_message_id=result.get("provider_message_id"),
-        )
 
-        outbound_internet_message_id = result.get("internet_message_id")
+def _send_message_by_email(message_id: int) -> dict:
+    message = repo.get_message_by_id(message_id)
 
-        if hasattr(repo, "record_email_message_header"):
-            repo.record_email_message_header(
-                message_id=message_id,
-                case_id=int(message["case_id"]),
-                supplier_id=int(message["supplier_id"]),
-                subject=subject,
-                internet_message_id=outbound_internet_message_id,
-                in_reply_to=in_reply_to,
-                reference_chain=references,
-                graph_conversation_id=None,
-            )
+    if message is None:
+        raise ValueError("Message not found.")
 
-    else:
+    if message["direction"] != "outbound":
+        raise ValueError("Only outbound messages can be sent by email.")
+
+    if not message.get("email"):
         repo.mark_message_send_failed(
             message_id=message_id,
-            error=result.get("error") or "Unknown email send error.",
+            error="Supplier has no email address.",
         )
+        return {
+            "success": False,
+            "error": "Supplier has no email address.",
+        }
 
-    return result
+    context = build_email_delivery_context(message)
+
+    return attempt_email_delivery(
+        message_id=message_id,
+        case_id=int(message["case_id"]),
+        supplier_id=int(message["supplier_id"]),
+        to_email=message["email"],
+        subject=context["subject"],
+        body=message["body"],
+        in_reply_to=context["in_reply_to"],
+        references=context["references"],
+    )
 
 def _send_message_by_whatsapp(message_id: int) -> dict:
     message = repo.get_message_by_id(message_id)
@@ -261,23 +259,171 @@ def _send_message_by_whatsapp(message_id: int) -> dict:
             "error": "Supplier has no WhatsApp number.",
         }
 
-    result = send_whatsapp_text(
+    return attempt_whatsapp_delivery(
+        message_id=message_id,
+        case_id=int(message["case_id"]),
+        supplier_id=int(message["supplier_id"]),
         to_number=whatsapp_number,
         body=message["body"],
     )
 
-    if result["success"]:
-        repo.mark_message_sent_whatsapp(
-            message_id=message_id,
-            provider_message_id=result.get("provider_message_id"),
+
+def apply_deferred_delivery_side_effects(message_id: int) -> None:
+    """Apply the supplier-state/case-status update a synchronous send
+    success would have applied immediately, for a message whose first
+    attempt failed transiently and was only delivered later by the
+    transport worker's automatic retry.
+
+    Must only ever be called from the transport worker's retry path (see
+    transport_worker_service._retry_one_due_outbox_job). A message reaches
+    that path only after its outbox job was left in transient_failure by a
+    previous attempt, so calling this here can never double-apply a state
+    transition that a first-attempt success already applied inline in
+    execute_rfq_rule_action / execute_negotiation_rule_action /
+    generate_and_send_winner_notification_for_supplier below. Kept
+    deliberately separate from those functions (rather than sharing code
+    with them) so this reconciliation path cannot change their existing,
+    already-tested behavior; if the on-success side effects for an action
+    type change there, update the matching branch here too.
+
+    Message types with no listed branch had no special on-success state
+    update in the synchronous path either, so no action is taken for them.
+    """
+    message = repo.get_message_by_id(message_id)
+
+    if message is None or message.get("supplier_id") is None:
+        return
+
+    case_id = int(message["case_id"])
+    supplier_id = int(message["supplier_id"])
+    message_type = message.get("message_type")
+
+    supplier_name = message.get("supplier_name") or "the supplier"
+
+    if message_type == "rfq":
+        repo.set_supplier_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.AWAITING_RESPONSE.value,
         )
-    else:
-        repo.mark_message_send_failed(
-            message_id=message_id,
-            error=result.get("error") or "Unknown WhatsApp send error.",
+        repo.update_case_status_with_event(
+            case_id=case_id,
+            status=CaseState.COLLECTING_OFFERS.value,
+            event_type="rfq_sent",
+            details=(
+                f"RFQ delivered for supplier {supplier_name} after an "
+                "automatic retry."
+            ),
         )
 
-    return result
+    elif message_type == "rfq_reminder":
+        repo.set_supplier_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.RFQ_REMINDER_SENT.value,
+        )
+
+    elif message_type == "clarification_request":
+        repo.set_supplier_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.CLARIFICATION_SENT.value,
+        )
+        repo.set_supplier_policy_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.CLARIFICATION_SENT.value,
+        )
+        repo.update_case_status_with_event(
+            case_id=case_id,
+            status=CaseState.COLLECTING_OFFERS.value,
+            event_type="clarification_request_sent",
+            details=(
+                f"Clarification request delivered for supplier "
+                f"{supplier_name} after an automatic retry."
+            ),
+        )
+
+    elif message_type == "provisional_price_acknowledgement":
+        repo.set_supplier_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.AWAITING_PRICE_CONFIRMATION.value,
+        )
+        repo.set_supplier_policy_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.AWAITING_PRICE_CONFIRMATION.value,
+        )
+        repo.log_worker_event(
+            case_id=case_id,
+            event_type="provisional_price_acknowledged",
+            details=(
+                f"Acknowledged provisional price for supplier "
+                f"{supplier_name} after an automatic retry."
+            ),
+        )
+
+    elif message_type == "supplier_question_response":
+        repo.set_supplier_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.WAITING_FOR_OFFER.value,
+        )
+        repo.set_supplier_policy_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.WAITING_FOR_OFFER.value,
+        )
+        repo.log_worker_event(
+            case_id=case_id,
+            event_type="supplier_question_answered",
+            details=(
+                f"Answered case-related question for supplier "
+                f"{supplier_name} after an automatic retry."
+            ),
+        )
+
+    elif message_type == "price_reduction_request":
+        best_offer = repo.get_best_offer_for_case_supplier(
+            case_id=case_id,
+            supplier_id=supplier_id,
+        )
+        context = repo.get_case_negotiation_context(case_id)
+
+        if best_offer is None or context is None:
+            return
+
+        repo.set_supplier_policy_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.DISCOUNT_REQUEST_SENT.value,
+            best_offer_usd=float(best_offer["unit_price_usd"]),
+            target_price_usd=float(context["target_price_usd"]),
+        )
+        repo.increment_negotiation_attempt(
+            case_id=case_id,
+            supplier_id=supplier_id,
+        )
+        repo.log_worker_event(
+            case_id=case_id,
+            event_type="target_price_request_sent",
+            details=(
+                f"Target-price request delivered for supplier "
+                f"{supplier_name} after an automatic retry."
+            ),
+        )
+
+    elif message_type == "winner_notification":
+        repo.update_case_status_with_event(
+            case_id=case_id,
+            status=CaseState.WINNER_NOTIFIED.value,
+            event_type="winner_notification_sent",
+            details=(
+                f"Winner notification delivered for supplier "
+                f"{supplier_name} after an automatic retry."
+            ),
+        )
 
 def send_or_display_outbound_message(
     case_id: int,
