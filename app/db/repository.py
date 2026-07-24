@@ -9,6 +9,7 @@ from app.db.database import get_connection
 
 
 ACTION_LOCK_LEASE_SECONDS = 300
+OUTBOX_LOCK_LEASE_SECONDS = 300
 
 CASE_NUMBER_DATE_FORMAT = "%Y-%m-%d"
 CASE_NUMBER_MAX_ATTEMPTS = 5
@@ -2936,6 +2937,171 @@ class PurchasingRepository:
 
             conn.commit()
 
+    # ---------- WhatsApp inbound event staging ----------
+
+    def create_whatsapp_inbound_event(
+            self,
+            wa_message_id: str,
+            sender_phone: str,
+            body: str,
+            received_at: str | None,
+    ) -> bool:
+        """Persist one inbound WhatsApp webhook event quickly.
+
+        Returns True if newly inserted, False if this wa_message_id was
+        already recorded (a duplicate delivery from Meta).
+        """
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO whatsapp_inbound_events
+                (
+                    wa_message_id,
+                    sender_phone,
+                    body,
+                    received_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (wa_message_id, sender_phone, body, received_at),
+            )
+            conn.commit()
+
+        return cursor.rowcount == 1
+
+    def claim_next_whatsapp_inbound_event(self, worker_id: str) -> dict | None:
+        """Atomically claim one pending inbound WhatsApp event, if any.
+
+        Races safely against concurrent callers (a background task and the
+        worker's poll loop) the same way claim_next_outbox_job does.
+        """
+        with get_connection() as conn:
+            candidates = conn.execute(
+                """
+                SELECT id
+                FROM whatsapp_inbound_events
+                WHERE status = 'received'
+                ORDER BY id ASC
+                """
+            ).fetchall()
+
+            for candidate in candidates:
+                candidate_id = int(candidate["id"])
+
+                cursor = conn.execute(
+                    """
+                    UPDATE whatsapp_inbound_events
+                    SET status = 'processing',
+                        locked_at = CURRENT_TIMESTAMP,
+                        locked_by = ?
+                    WHERE id = ?
+                      AND status = 'received'
+                    """,
+                    (worker_id, candidate_id),
+                )
+
+                if cursor.rowcount == 1:
+                    conn.commit()
+
+                    row = conn.execute(
+                        """
+                        SELECT *
+                        FROM whatsapp_inbound_events
+                        WHERE id = ?
+                        """,
+                        (candidate_id,),
+                    ).fetchone()
+
+                    return dict(row) if row else None
+
+            conn.commit()
+
+        return None
+
+    def mark_whatsapp_inbound_event_processed(
+            self,
+            event_id: int,
+            case_id: int | None,
+            supplier_id: int | None,
+            message_id: int | None,
+    ) -> None:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE whatsapp_inbound_events
+                SET status = 'processed',
+                    case_id = ?,
+                    supplier_id = ?,
+                    message_id = ?,
+                    error = NULL,
+                    processed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (case_id, supplier_id, message_id, event_id),
+            )
+            conn.commit()
+
+    def mark_whatsapp_inbound_event_failed(
+            self,
+            event_id: int,
+            error: str,
+    ) -> None:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE whatsapp_inbound_events
+                SET status = 'failed',
+                    error = ?,
+                    processed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (error, event_id),
+            )
+            conn.commit()
+
+    def reclaim_abandoned_whatsapp_inbound_events(
+            self,
+            lease_seconds: int = OUTBOX_LOCK_LEASE_SECONDS,
+    ) -> list[dict]:
+        """Move abandoned 'processing' inbound events to 'failed'.
+
+        Re-processing an inbound WhatsApp message is not safe to retry
+        blindly: record_supplier_message_simple is not idempotent and would
+        insert a second copy of the same supplier message (and could trigger
+        a second negotiation action) if run twice. An event abandoned by a
+        crash or restart is therefore surfaced as failed for manual review
+        rather than silently reprocessed.
+        """
+        stale_modifier = f"-{lease_seconds} seconds"
+
+        with get_connection() as conn:
+            stale_rows = conn.execute(
+                """
+                SELECT *
+                FROM whatsapp_inbound_events
+                WHERE status = 'processing'
+                  AND locked_at <= datetime('now', ?)
+                """,
+                (stale_modifier,),
+            ).fetchall()
+
+            reclaimed = [dict(row) for row in stale_rows]
+
+            if reclaimed:
+                conn.execute(
+                    """
+                    UPDATE whatsapp_inbound_events
+                    SET status = 'failed',
+                        error = 'Processing was interrupted by a worker or process restart; it is unclear whether this event was already recorded. Check the case chat history before manually reprocessing.',
+                        processed_at = CURRENT_TIMESTAMP
+                    WHERE status = 'processing'
+                      AND locked_at <= datetime('now', ?)
+                    """,
+                    (stale_modifier,),
+                )
+                conn.commit()
+
+        return reclaimed
 
     def mark_message_sent_whatsapp(
         self,
@@ -3956,6 +4122,351 @@ class PurchasingRepository:
                 LIMIT 1
                 """,
                 (case_id, supplier_id),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    # ---------- Transport outbox ----------
+
+    def create_outbox_job(
+            self,
+            message_id: int,
+            case_id: int,
+            supplier_id: int | None,
+            channel: str,
+    ) -> int:
+        """Create a transport_outbox job for one outbound message.
+
+        Idempotent: calling this more than once for the same message_id
+        returns the existing job instead of creating a duplicate row. The
+        idempotency key is derived from message_id because the higher-level
+        decision "should this action happen at all" is already guarded
+        upstream (negotiation_action_locks, message-type counts) before a
+        messages row is ever created; this key only protects the enqueue
+        step itself against being repeated after a crash.
+        """
+        idempotency_key = f"outbox:{message_id}"
+
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO transport_outbox
+                (
+                    message_id,
+                    case_id,
+                    supplier_id,
+                    channel,
+                    idempotency_key
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (message_id, case_id, supplier_id, channel, idempotency_key),
+            )
+            conn.commit()
+
+            row = conn.execute(
+                """
+                SELECT id
+                FROM transport_outbox
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+
+        if row is None:
+            raise ValueError(
+                f"Failed to create or find outbox job for message {message_id}."
+            )
+
+        return int(row["id"])
+
+    def claim_next_outbox_job(self, worker_id: str) -> dict | None:
+        """Atomically claim one due outbox job for delivery.
+
+        Returns the claimed job, or None if nothing is currently due.
+        Concurrent callers (Streamlit, the WhatsApp webhook, the standalone
+        worker loop) race safely because the claim is a single conditional
+        UPDATE guarded by the row's current status, not an in-memory lock.
+        """
+        with get_connection() as conn:
+            candidates = conn.execute(
+                """
+                SELECT id
+                FROM transport_outbox
+                WHERE status IN ('pending', 'transient_failure')
+                  AND (
+                    next_attempt_at IS NULL
+                    OR next_attempt_at <= CURRENT_TIMESTAMP
+                  )
+                ORDER BY
+                    next_attempt_at IS NULL DESC,
+                    next_attempt_at ASC,
+                    id ASC
+                """
+            ).fetchall()
+
+            for candidate in candidates:
+                candidate_id = int(candidate["id"])
+
+                cursor = conn.execute(
+                    """
+                    UPDATE transport_outbox
+                    SET status = 'processing',
+                        locked_at = CURRENT_TIMESTAMP,
+                        locked_by = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                      AND status IN ('pending', 'transient_failure')
+                    """,
+                    (worker_id, candidate_id),
+                )
+
+                if cursor.rowcount == 1:
+                    conn.commit()
+
+                    row = conn.execute(
+                        """
+                        SELECT *
+                        FROM transport_outbox
+                        WHERE id = ?
+                        """,
+                        (candidate_id,),
+                    ).fetchone()
+
+                    return dict(row) if row else None
+
+            conn.commit()
+
+        return None
+
+    def claim_outbox_job_by_id(
+            self,
+            outbox_id: int,
+            worker_id: str,
+    ) -> dict | None:
+        """Atomically claim one specific outbox job, if still claimable.
+
+        Used for the immediate first-attempt path, right after enqueueing,
+        as opposed to claim_next_outbox_job's due-queue scan used by the
+        background retry sweep. Returns None if the job is not in a
+        claimable state (already processing, already resolved, or does not
+        exist).
+        """
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE transport_outbox
+                SET status = 'processing',
+                    locked_at = CURRENT_TIMESTAMP,
+                    locked_by = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND status IN ('pending', 'transient_failure')
+                """,
+                (worker_id, outbox_id),
+            )
+
+            if cursor.rowcount != 1:
+                conn.commit()
+                return None
+
+            conn.commit()
+
+            row = conn.execute(
+                """
+                SELECT *
+                FROM transport_outbox
+                WHERE id = ?
+                """,
+                (outbox_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def mark_outbox_sent(
+            self,
+            outbox_id: int,
+            provider_message_id: str | None,
+    ) -> None:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE transport_outbox
+                SET status = 'sent',
+                    attempt_count = attempt_count + 1,
+                    provider_message_id = ?,
+                    last_error = NULL,
+                    failure_type = NULL,
+                    next_attempt_at = NULL,
+                    sent_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (provider_message_id, outbox_id),
+            )
+            conn.commit()
+
+    def mark_outbox_simulated(
+            self,
+            outbox_id: int,
+            provider_message_id: str | None,
+    ) -> None:
+        """Record a dry-run/test-mode outcome (no real provider call made).
+
+        Distinct from a real send, and distinct from case-level simulation
+        mode (which never creates an outbox row at all).
+        """
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE transport_outbox
+                SET status = 'simulated',
+                    attempt_count = attempt_count + 1,
+                    provider_message_id = ?,
+                    last_error = NULL,
+                    failure_type = NULL,
+                    next_attempt_at = NULL,
+                    sent_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (provider_message_id, outbox_id),
+            )
+            conn.commit()
+
+    def mark_outbox_transient_failure(
+            self,
+            outbox_id: int,
+            error: str,
+            next_attempt_at: str | None,
+    ) -> None:
+        """Record a retryable failure.
+
+        ``next_attempt_at`` is computed by the caller from the backoff
+        schedule (a delivery-policy concern, not a storage concern). Pass
+        None once the maximum attempt count has been reached; the caller
+        must then call mark_outbox_permanent_failure instead so the job
+        does not remain retryable forever.
+        """
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE transport_outbox
+                SET status = 'transient_failure',
+                    attempt_count = attempt_count + 1,
+                    last_error = ?,
+                    failure_type = 'transient',
+                    next_attempt_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (error, next_attempt_at, outbox_id),
+            )
+            conn.commit()
+
+    def mark_outbox_permanent_failure(
+            self,
+            outbox_id: int,
+            error: str,
+    ) -> None:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE transport_outbox
+                SET status = 'permanent_failure',
+                    attempt_count = attempt_count + 1,
+                    last_error = ?,
+                    failure_type = 'permanent',
+                    next_attempt_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (error, outbox_id),
+            )
+            conn.commit()
+
+    def mark_outbox_delivery_unknown(
+            self,
+            outbox_id: int,
+            error: str,
+    ) -> None:
+        """Record an ambiguous outcome.
+
+        A timeout or connection loss during the send means it is unknown
+        whether the provider accepted the message. This must never be
+        auto-retried, since a retry could create a real duplicate send; it
+        is surfaced for human review instead.
+        """
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE transport_outbox
+                SET status = 'delivery_unknown',
+                    attempt_count = attempt_count + 1,
+                    last_error = ?,
+                    failure_type = 'unknown',
+                    next_attempt_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (error, outbox_id),
+            )
+            conn.commit()
+
+    def reclaim_abandoned_outbox_jobs(
+            self,
+            lease_seconds: int = OUTBOX_LOCK_LEASE_SECONDS,
+    ) -> list[dict]:
+        """Move abandoned 'processing' jobs to 'delivery_unknown'.
+
+        A hard process or computer crash can occur after a job is claimed
+        (status='processing') but before the send outcome is recorded. Such
+        a job must not be silently retried, because the provider may already
+        have accepted it, and must not be silently forgotten either. Returns
+        the reclaimed rows so the caller can raise human review for them.
+        """
+        stale_modifier = f"-{lease_seconds} seconds"
+
+        with get_connection() as conn:
+            stale_rows = conn.execute(
+                """
+                SELECT *
+                FROM transport_outbox
+                WHERE status = 'processing'
+                  AND locked_at <= datetime('now', ?)
+                """,
+                (stale_modifier,),
+            ).fetchall()
+
+            reclaimed = [dict(row) for row in stale_rows]
+
+            if reclaimed:
+                conn.execute(
+                    """
+                    UPDATE transport_outbox
+                    SET status = 'delivery_unknown',
+                        last_error = 'Processing lock abandoned after crash or restart; delivery status unknown.',
+                        failure_type = 'unknown',
+                        next_attempt_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE status = 'processing'
+                      AND locked_at <= datetime('now', ?)
+                    """,
+                    (stale_modifier,),
+                )
+                conn.commit()
+
+        return reclaimed
+
+    def get_outbox_status_for_message(self, message_id: int) -> dict | None:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM transport_outbox
+                WHERE message_id = ?
+                """,
+                (message_id,),
             ).fetchone()
 
         return dict(row) if row else None

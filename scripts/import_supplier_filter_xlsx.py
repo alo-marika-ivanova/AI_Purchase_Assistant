@@ -90,9 +90,43 @@ def make_dummy_whatsapp(index: int) -> str:
 class SupplierRow:
     name: str
     contact_person: str | None
-    email: str
-    whatsapp_number: str
+    contact_channel: str
+    email: str | None
+    whatsapp_number: str | None
     supplier_code: str
+    is_dummy_contact: bool = False
+
+
+def resolve_supplier_contact(
+    name: str,
+    real_email: str | None,
+    real_whatsapp_number: str | None,
+    dummy_index: int,
+    default_channel: str,
+) -> tuple[str, str | None, str | None, bool]:
+    """Decide the contact channel and email/WhatsApp values for one supplier.
+
+    Real contact data always wins and is never overwritten with invented
+    data. A real value in one channel does not cause the other channel to
+    be invented either: a supplier with a real phone number but no email
+    becomes a whatsapp-channel supplier with no email at all, and a supplier
+    with a real email but no phone becomes an email-channel supplier with no
+    WhatsApp number. A placeholder email and WhatsApp number are invented
+    only when the supplier has neither in the workbook, purely so it still
+    has one usable contact for testing.
+    """
+    if real_email:
+        return "email", real_email, real_whatsapp_number, False
+
+    if real_whatsapp_number:
+        return "whatsapp", None, real_whatsapp_number, False
+
+    return (
+        default_channel,
+        make_dummy_email(name),
+        make_dummy_whatsapp(dummy_index),
+        True,
+    )
 
 
 @dataclass(frozen=True)
@@ -104,7 +138,10 @@ class MappingRow:
     source_column: str
 
 
-def iter_supplier_rows(workbook_path: Path) -> list[SupplierRow]:
+def iter_supplier_rows(
+    workbook_path: Path,
+    default_channel: str = "email",
+) -> list[SupplierRow]:
     wb = load_workbook(workbook_path, data_only=True)
     if SUPPLIER_SHEET not in wb.sheetnames:
         raise ValueError(f"Workbook is missing sheet: {SUPPLIER_SHEET!r}")
@@ -125,16 +162,29 @@ def iter_supplier_rows(workbook_path: Path) -> list[SupplierRow]:
         seen_names.add(name_key)
 
         contact_person = clean_text(ws.cell(row=row_index, column=3).value) or None
-        email = clean_text(ws.cell(row=row_index, column=4).value)
-        phone = clean_text(ws.cell(row=row_index, column=5).value)
+        real_email = clean_text(ws.cell(row=row_index, column=4).value) or None
+        raw_phone = clean_text(ws.cell(row=row_index, column=5).value)
+        real_whatsapp_number = re.sub(r"\D+", "", raw_phone) or None
+
+        contact_channel, email, whatsapp_number, is_dummy_contact = (
+            resolve_supplier_contact(
+                name=name,
+                real_email=real_email,
+                real_whatsapp_number=real_whatsapp_number,
+                dummy_index=len(suppliers) + 1,
+                default_channel=default_channel,
+            )
+        )
 
         suppliers.append(
             SupplierRow(
                 name=name,
                 contact_person=contact_person,
-                email=email or make_dummy_email(name),
-                whatsapp_number=re.sub(r"\D+", "", phone) or make_dummy_whatsapp(len(suppliers) + 1),
+                contact_channel=contact_channel,
+                email=email,
+                whatsapp_number=whatsapp_number,
                 supplier_code=make_supplier_code(name, used_codes),
+                is_dummy_contact=is_dummy_contact,
             )
         )
 
@@ -281,9 +331,11 @@ def upsert_suppliers_and_mappings(
             SupplierRow(
                 name=extra_name,
                 contact_person=None,
+                contact_channel=default_channel,
                 email=make_dummy_email(extra_name),
                 whatsapp_number=make_dummy_whatsapp(len(all_suppliers) + 1),
                 supplier_code=make_supplier_code(extra_name, used_codes),
+                is_dummy_contact=True,
             )
         )
 
@@ -306,7 +358,11 @@ def upsert_suppliers_and_mappings(
             notes_parts = ["Imported from buyer supplier XLSX."]
             if supplier.contact_person:
                 notes_parts.append(f"Contact person: {supplier.contact_person}.")
-            notes_parts.append("Email and WhatsApp may be dummy presentation data.")
+            if supplier.is_dummy_contact:
+                notes_parts.append(
+                    "No real contact was found in the workbook; email and "
+                    "WhatsApp number are placeholder data for testing only."
+                )
             notes = " ".join(notes_parts)
 
             existing = conn.execute(
@@ -337,7 +393,7 @@ def upsert_suppliers_and_mappings(
                     """,
                     (
                         supplier.name,
-                        default_channel,
+                        supplier.contact_channel,
                         supplier.whatsapp_number,
                         supplier.email,
                         "Imported buyer supplier list",
@@ -355,7 +411,7 @@ def upsert_suppliers_and_mappings(
                     (
                         supplier.supplier_code,
                         supplier.name,
-                        default_channel,
+                        supplier.contact_channel,
                         supplier.whatsapp_number,
                         supplier.email,
                         "Imported buyer supplier list",
@@ -519,7 +575,7 @@ def import_workbook(
     if not xlsx_path.exists():
         raise FileNotFoundError(f"XLSX file not found: {xlsx_path}")
 
-    suppliers = iter_supplier_rows(xlsx_path)
+    suppliers = iter_supplier_rows(xlsx_path, default_channel=default_channel)
     mappings = iter_mapping_rows(xlsx_path, suppliers)
 
     current_supplier_names = get_current_workbook_supplier_names(
