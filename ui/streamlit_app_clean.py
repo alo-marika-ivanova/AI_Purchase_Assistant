@@ -282,17 +282,30 @@ with selector_col:
         st.warning("No suppliers linked to this case.")
         selected_supplier = None
     else:
-        supplier_options = {
-            f"{supplier['name']} | {supplier['supplier_code']}": supplier
-            for supplier in case_suppliers
+        supplier_by_id = {
+            int(supplier["id"]): supplier for supplier in case_suppliers
         }
 
-        selected_supplier_label = st.selectbox(
-            "Select supplier",
-            options=list(supplier_options.keys()),
-        )
+        active_supplier_id = st.session_state.get("selected_supplier_id")
+        if active_supplier_id not in supplier_by_id:
+            active_supplier_id = int(case_suppliers[0]["id"])
+            st.session_state["selected_supplier_id"] = active_supplier_id
 
-        selected_supplier = supplier_options[selected_supplier_label]
+        for supplier in case_suppliers:
+            supplier_id = int(supplier["id"])
+            is_active = supplier_id == active_supplier_id
+
+            if st.button(
+                f"{supplier['name']} | {supplier['supplier_code']}",
+                key=f"supplier_select_{selected_case_id}_{supplier_id}",
+                type="primary" if is_active else "secondary",
+                use_container_width=True,
+            ):
+                if supplier_id != active_supplier_id:
+                    st.session_state["selected_supplier_id"] = supplier_id
+                    st.rerun()
+
+        selected_supplier = supplier_by_id[active_supplier_id]
 
     st.markdown("### Communication / automation")
 
