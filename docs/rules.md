@@ -172,21 +172,23 @@ For a soft or firm refusal: record the refusal and, if negotiation rounds remain
 
 ### Supplier Does Not Respond During Negotiation
 
+No-response reminders are separate from negotiation rounds: sending a reminder does not count as one of the four negotiation messages and does not request a new price.
+
 Production settings:
 
-* Wait **1 business day**.
-* Send one short reminder.
-* Wait another business day.
-* If there is still no response, use the supplier’s latest valid confirmed offer as the final offer.
+* Wait **2 business days** after the unanswered negotiation request, then send the first reminder.
+* Send further reminders every **2 business days**, up to a maximum of **3 reminders** for the current unanswered round.
+* If there is still no response **2 business days** after the third reminder, retain the supplier's latest valid confirmed offer and mark the supplier `FINAL_OFFER_RECEIVED`.
 
 Testing settings:
 
-* Wait **2 minutes**.
-* Send one reminder.
-* Wait another **2 minutes**.
-* If there is still no response, use the latest valid confirmed offer as the final offer.
+* Wait **2 minutes** after the unanswered negotiation request, then send the first reminder.
+* Send further reminders every **2 minutes**, up to a maximum of **3 reminders**.
+* If there is still no response **2 minutes** after the third reminder, retain the latest valid confirmed offer and finalize.
 
-The system must not send another negotiation message before the supplier replies or the applicable reminder deadline is reached.
+The reminder sequence uses three distinct, gradually more conclusive messages: a friendly status check, a direct follow-up asking whether the requested price is possible, and a final request for the supplier's best possible price before the comparison closes. The exact target/requested price is always supplied by the application; the message writer does not invent one.
+
+Any inbound supplier reply cancels the pending reminder sequence for that round immediately. The system must not send another negotiation message, or another reminder, before the supplier replies or the applicable deadline is reached.
 
 ## 8. When No Supplier Accepts the Target Price
 
@@ -292,7 +294,8 @@ The following actions require Ela’s confirmation or intervention:
 * RFQ closed without response after: **2 business days**
 * Target price: **10% below the best confirmed offer**
 * Maximum negotiation messages per supplier: **4** (persistent but controlled negotiation; see Section 6)
-* Negotiation follow-up after: **1 business day**
+* Negotiation no-response reminder interval: **2 business days** (first reminder and every reminder after; see Section 7)
+* Maximum negotiation no-response reminders: **3**, then finalize after one more 2-business-day wait
 * Maximum AI messages without a supplier response: **2**
 * Acceptable tolerance above target price: **5%**
 * Winner notification: **Always requires Ela’s action**
@@ -303,7 +306,8 @@ The following actions require Ela’s confirmation or intervention:
 * RFQ closed without response after: **4 minutes**
 * Target price: **10% below the best confirmed offer**
 * Maximum negotiation messages per supplier: **4** (persistent but controlled negotiation; see Section 6)
-* Negotiation follow-up after: **2 minutes**
+* Negotiation no-response reminder interval: **2 minutes** (first reminder and every reminder after; see Section 7)
+* Maximum negotiation no-response reminders: **3**, then finalize after one more 2-minute wait
 * Maximum AI messages without a supplier response: **2**
 * Acceptable tolerance above target price: **5%**
 * Winner notification: **Simulated or manually confirmed**

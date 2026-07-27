@@ -138,3 +138,120 @@ def plan_negotiation_round(
             supplier_best_price_usd=float(supplier_best_price_usd),
         ),
     )
+
+
+# ---------------------------------------------------------------------
+# No-response reminders
+#
+# Reminders are a separate concern from negotiation rounds above: they
+# never request a new price and must never count as a persuasive
+# negotiation round. Each of the (at most 3) reminders for one
+# unanswered round uses a distinct, gradually more conclusive strategy,
+# and always states the exact, already-decided target price -- the LLM
+# must not invent one.
+# ---------------------------------------------------------------------
+
+REMINDER_STATUS_CHECK = "STATUS_CHECK"
+REMINDER_TARGET_FOLLOWUP = "TARGET_FOLLOWUP"
+REMINDER_FINAL_FOLLOWUP = "FINAL_FOLLOWUP"
+
+_REMINDER_STRATEGY_BY_POSITION = {
+    1: REMINDER_STATUS_CHECK,
+    2: REMINDER_TARGET_FOLLOWUP,
+    3: REMINDER_FINAL_FOLLOWUP,
+}
+
+_REMINDER_INTENT_BY_STRATEGY = {
+    REMINDER_STATUS_CHECK: "negotiation_status_check",
+    REMINDER_TARGET_FOLLOWUP: "negotiation_target_followup",
+    REMINDER_FINAL_FOLLOWUP: "negotiation_final_followup",
+}
+
+
+@dataclass(frozen=True)
+class NegotiationReminderPlan:
+    """One deterministically chosen no-response reminder.
+
+    ``target_price_usd`` is always the case's fixed target price, passed
+    through so the communication writer never has to invent a number.
+    """
+
+    position: int
+    strategy: str
+    llm_intent: str
+    target_price_usd: float
+    extra_context: str
+
+
+def reminder_strategy_for_position(position: int) -> str:
+    """Return the strategy identifier for a reminder position (1-3)."""
+    if position not in _REMINDER_STRATEGY_BY_POSITION:
+        raise ValueError(
+            f"No no-response reminder strategy is defined for position "
+            f"{position}."
+        )
+    return _REMINDER_STRATEGY_BY_POSITION[position]
+
+
+def reminder_intent_for_strategy(strategy: str) -> str:
+    """Return the communication-writer intent for a reminder strategy."""
+    if strategy not in _REMINDER_INTENT_BY_STRATEGY:
+        raise ValueError(f"Unknown no-response reminder strategy: {strategy!r}")
+    return _REMINDER_INTENT_BY_STRATEGY[strategy]
+
+
+def _extra_context_for_reminder(position: int, target_price_usd: float) -> str:
+    target_text = f"{target_price_usd:.2f}"
+
+    if position == 1:
+        return (
+            "The supplier has not replied to our price-negotiation "
+            "message yet. Send a brief, friendly status check asking "
+            "whether they have had a chance to look at our requested "
+            "price. Keep it short and low-pressure. Do not restate the "
+            "exact number as a demand; a light mention is fine, but the "
+            "tone should be a simple check-in, not a follow-up push."
+        )
+
+    if position == 2:
+        return (
+            "The supplier still has not replied after a first status "
+            "check. Send a direct follow-up asking clearly whether USD "
+            f"{target_text} per unit would be possible for them. Be "
+            "polite but more direct than the previous message."
+        )
+
+    if position == 3:
+        return (
+            "The supplier still has not replied after two previous "
+            "reminders. This is the final reminder before the "
+            "comparison is closed. Ask for their best possible price "
+            "before a decision is made. Make clear, politely and "
+            "professionally, that this is the last opportunity to "
+            "respond, without sounding aggressive."
+        )
+
+    raise ValueError(
+        f"No no-response reminder strategy is defined for position {position}."
+    )
+
+
+def plan_negotiation_reminder(
+    position: int,
+    target_price_usd: float,
+) -> NegotiationReminderPlan:
+    """Deterministically choose the strategy, intent, and exact target
+    price for one no-response reminder. The communication writer only
+    phrases this plan; it must not change the strategy or invent a price."""
+    strategy = reminder_strategy_for_position(position)
+
+    return NegotiationReminderPlan(
+        position=position,
+        strategy=strategy,
+        llm_intent=reminder_intent_for_strategy(strategy),
+        target_price_usd=float(target_price_usd),
+        extra_context=_extra_context_for_reminder(
+            position=position,
+            target_price_usd=float(target_price_usd),
+        ),
+    )

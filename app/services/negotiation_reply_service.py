@@ -10,6 +10,7 @@ from app.llm.communication_writer import write_buyer_message
 from app.llm.supplier_message_classifier import (
     analyze_supplier_message_with_ollama,
 )
+from app.negotiation.business_time import compute_next_reminder_due_at
 from app.negotiation.common_reply_policy import (
     decide_common_negotiation_reply,
 )
@@ -490,6 +491,9 @@ def record_negotiation_supplier_message(
             supplier_id=supplier_id,
             strategy=round_plan.strategy,
             requested_price_usd=round_plan.requested_price_usd,
+            next_reminder_due_at=compute_next_reminder_due_at(
+                policy, datetime.utcnow()
+            ).strftime("%Y-%m-%d %H:%M:%S"),
         )
 
         repo.set_supplier_policy_state(

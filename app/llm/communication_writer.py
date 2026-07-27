@@ -342,6 +342,39 @@ def fallback_message(
         )
         reason = "Fallback final best-price request."
 
+    elif intent == "negotiation_status_check":
+        body = (
+            f"{opening} {supplier_name},\n\n"
+            f"Have you had a chance to check our requested price for "
+            f"{item}? Just a quick check-in -- no rush.\n\nBest regards"
+        )
+        reason = "Fallback friendly no-response status check."
+
+    elif intent == "negotiation_target_followup":
+        if target_price_usd is None:
+            raise ValueError(
+                "Target price is required for negotiation-reminder-2 wording."
+            )
+
+        target_text = _format_usd_price(target_price_usd)
+        body = (
+            f"{opening} {supplier_name},\n\n"
+            f"Following up on {item}: could you please confirm whether "
+            f"USD {target_text} per unit would be possible for "
+            "you?\n\nBest regards"
+        )
+        reason = "Fallback direct no-response target-price follow-up."
+
+    elif intent == "negotiation_final_followup":
+        body = (
+            f"{opening} {supplier_name},\n\n"
+            f"Before we close the comparison for {item}, could you please "
+            "confirm your best possible price? This will be the last "
+            "opportunity to respond before a decision is made.\n\n"
+            "Best regards"
+        )
+        reason = "Fallback final no-response follow-up."
+
     elif intent == "winner_notification":
         price_text = (
             _format_usd_price(winning_price_usd)
@@ -532,6 +565,22 @@ Return JSON only in this exact format:
             ):
                 raise ValueError(
                     "LLM acknowledgment omitted the provisional price."
+                )
+
+        if intent == "negotiation_target_followup":
+            if target_price_usd is None:
+                raise ValueError(
+                    "Target price is required for the no-response "
+                    "target-price follow-up reminder."
+                )
+
+            if not _message_mentions_target_price(
+                message=message,
+                target_price_usd=target_price_usd,
+            ):
+                raise ValueError(
+                    "LLM no-response reminder omitted the explicit "
+                    "target price."
                 )
 
         return {

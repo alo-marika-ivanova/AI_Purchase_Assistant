@@ -23,5 +23,9 @@
   "max_outbound_without_supplier_reply": 2,
   "max_negotiation_rounds_per_supplier": 4,
 
+  "negotiation_reminder_interval_business_days": 2,
+  "negotiation_reminder_interval_test_seconds": 120,
+  "max_negotiation_no_response_reminders": 3,
+
   "pause_on_unknown_or_risky_topic": true
 }

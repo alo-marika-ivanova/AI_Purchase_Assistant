@@ -54,6 +54,15 @@ class NegotiationPolicy:
     # decisions in app/services/negotiation_reply_service.py.
     max_negotiation_rounds_per_supplier: int = 4
 
+    # No-response reminders for an unanswered negotiation-round message.
+    # Separate from negotiation rounds: sending a reminder must never
+    # increment negotiation_attempts. The same interval is reused both
+    # between reminders and for the final wait after the last reminder
+    # before finalizing (see app/negotiation/negotiation_reminder_rules.py).
+    negotiation_reminder_interval_business_days: int = 2
+    negotiation_reminder_interval_test_seconds: int = 120
+    max_negotiation_no_response_reminders: int = 3
+
     pause_on_unknown_or_risky_topic: bool = True
 
     def __post_init__(self) -> None:
@@ -77,6 +86,9 @@ class NegotiationPolicy:
             "max_negotiation_reminders_per_supplier",
             "max_outbound_without_supplier_reply",
             "max_negotiation_rounds_per_supplier",
+            "negotiation_reminder_interval_business_days",
+            "negotiation_reminder_interval_test_seconds",
+            "max_negotiation_no_response_reminders",
         )
 
         for field_name in positive_integer_fields:
