@@ -301,6 +301,47 @@ def fallback_message(
         )
         reason = "Supplier-specific fallback target request."
 
+    elif intent == "acknowledge_refusal_and_recheck_target":
+        if target_price_usd is None:
+            raise ValueError(
+                "Target price is required for negotiation-round-2 wording."
+            )
+
+        target_text = _format_usd_price(target_price_usd)
+        body = (
+            f"{opening} {supplier_name},\n\n"
+            f"Thank you for getting back to us on {item}. We understand "
+            f"USD {target_text} per unit is difficult on your side. Would "
+            "you be able to check once more, internally, whether that "
+            "price could still be possible?\n\nBest regards"
+        )
+        reason = "Fallback acknowledgment of refusal with a recheck request."
+
+    elif intent == "express_interest_request_improvement":
+        if target_price_usd is None:
+            raise ValueError(
+                "Target price is required for negotiation-round-3 wording."
+            )
+
+        target_text = _format_usd_price(target_price_usd)
+        body = (
+            f"{opening} {supplier_name},\n\n"
+            f"We are genuinely interested in working with you on {item}. "
+            f"Is there any way to move a bit closer to USD {target_text} "
+            "per unit? Even a small further improvement would help us "
+            "move forward.\n\nBest regards"
+        )
+        reason = "Fallback expression of interest with an improvement request."
+
+    elif intent == "ask_absolute_best_price":
+        body = (
+            f"{opening} {supplier_name},\n\n"
+            f"Before we finalize our comparison for {item}, could you let "
+            "us know your absolute best final unit price in USD? This "
+            "will be the last opportunity to adjust it.\n\nBest regards"
+        )
+        reason = "Fallback final best-price request."
+
     elif intent == "winner_notification":
         price_text = (
             _format_usd_price(winning_price_usd)

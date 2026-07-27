@@ -46,6 +46,14 @@ class NegotiationPolicy:
     max_negotiation_reminders_per_supplier: int = 1
     max_outbound_without_supplier_reply: int = 2
 
+    # Persistent but controlled negotiation: up to this many price-negotiation
+    # requests may be sent per supplier (strategies 1-4 in
+    # app/negotiation/negotiation_engine.py). Deliberately a separate field
+    # from max_discount_requests_per_supplier, which only ever gated the
+    # first target-price request; this field governs round 2+ continuation
+    # decisions in app/services/negotiation_reply_service.py.
+    max_negotiation_rounds_per_supplier: int = 4
+
     pause_on_unknown_or_risky_topic: bool = True
 
     def __post_init__(self) -> None:
@@ -68,6 +76,7 @@ class NegotiationPolicy:
             "max_discount_requests_per_supplier",
             "max_negotiation_reminders_per_supplier",
             "max_outbound_without_supplier_reply",
+            "max_negotiation_rounds_per_supplier",
         )
 
         for field_name in positive_integer_fields:

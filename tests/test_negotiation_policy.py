@@ -35,6 +35,7 @@ def test_loaded_policy_matches_message_limits() -> None:
     assert policy.max_discount_requests_per_supplier == 2
     assert policy.max_negotiation_reminders_per_supplier == 1
     assert policy.max_outbound_without_supplier_reply == 2
+    assert policy.max_negotiation_rounds_per_supplier == 4
 
 
 def test_loaded_policy_matches_price_strategy() -> None:

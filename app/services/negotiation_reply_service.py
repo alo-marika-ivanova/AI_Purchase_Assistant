@@ -6,17 +6,24 @@ from app.db.repository import PurchasingRepository
 from app.services.human_review_notification_service import (
     create_human_review_item_with_notification,
 )
+from app.llm.communication_writer import write_buyer_message
 from app.llm.supplier_message_classifier import (
     analyze_supplier_message_with_ollama,
 )
 from app.negotiation.common_reply_policy import (
     decide_common_negotiation_reply,
 )
+from app.negotiation.negotiation_engine import plan_negotiation_round
+from app.negotiation.policy import load_negotiation_policy
 from app.negotiation.states import CaseState, SupplierState
 from app.services.offer_service import add_offer
 
 
 repo = PurchasingRepository()
+
+# Tolerance for float comparisons of USD unit prices (matches the tolerance
+# used in app/negotiation/common_reply_policy.py).
+_PRICE_TOLERANCE = 0.005
 
 
 def _find_case_supplier(case_id: int, supplier_id: int) -> dict:
@@ -315,11 +322,262 @@ def record_negotiation_supplier_message(
             ),
         }
 
+    policy = load_negotiation_policy()
+
+    # Number of price-negotiation rounds already sent to this supplier
+    # (>= 1, since this function is only reached once round 1 has been
+    # sent). Used to decide whether a refusal or a still-above-target
+    # improvement should continue negotiating or finalize.
+    existing_round_count = repo.count_supplier_outbound_message_type(
+        case_id=case_id,
+        supplier_id=supplier_id,
+        message_type="price_reduction_request",
+    )
+
+    def continue_or_finalize_negotiation(
+        effective_best_price: float,
+        finalize_reason: str,
+    ) -> dict:
+        """
+        Persistent but controlled negotiation: send the next round if any
+        remain, otherwise finalize and retain the best historical offer.
+
+        Shared by the "improved offer still above target" path and the
+        "refusal / same price repeated" path, since both follow the exact
+        same round-continuation rule.
+        """
+        next_round_number = existing_round_count + 1
+
+        if (
+            existing_round_count
+            >= policy.max_negotiation_rounds_per_supplier
+        ):
+            repo.set_supplier_policy_state(
+                case_id=case_id,
+                supplier_id=supplier_id,
+                state=SupplierState.FINAL_OFFER_RECEIVED.value,
+                best_offer_usd=effective_best_price,
+                target_price_usd=target_price_usd,
+            )
+
+            repo.log_worker_event(
+                case_id=case_id,
+                event_type="negotiation_rounds_exhausted",
+                details=(
+                    f"Supplier ID {supplier_id} reached the maximum of "
+                    f"{policy.max_negotiation_rounds_per_supplier} "
+                    "negotiation rounds. Best historical offer retained: "
+                    f"USD {effective_best_price:.2f}. {finalize_reason}"
+                ),
+            )
+
+            return {
+                "finalized": True,
+                "sent_round_number": None,
+            }
+
+        # Defensive guards against sending a round we already sent, or
+        # sending while still awaiting the reply to an already-sent round.
+        # The action lock below is the primary duplicate-prevention
+        # mechanism; this re-check of fresh DB state is a second,
+        # independent safeguard.
+        fresh_state = repo.get_supplier_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+        ) or {}
+
+        current_attempts = int(
+            fresh_state.get("negotiation_attempts") or 0
+        )
+        already_awaiting = bool(
+            fresh_state.get("awaiting_supplier_reply")
+        )
+
+        if current_attempts >= next_round_number or already_awaiting:
+            return {
+                "finalized": False,
+                "sent_round_number": None,
+                "skipped_reason": (
+                    "The next negotiation round was already sent, or the "
+                    "supplier is already awaiting a reply."
+                ),
+            }
+
+        round_plan = plan_negotiation_round(
+            round_number=next_round_number,
+            target_price_usd=target_price_usd,
+            supplier_best_price_usd=effective_best_price,
+        )
+
+        action_key = (
+            f"SEND_NEGOTIATION_ROUND:{supplier_id}:{next_round_number}"
+        )
+
+        lock_acquired = repo.acquire_action_lock(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            action_key=action_key,
+            action_type="SEND_NEGOTIATION_ROUND",
+        )
+
+        if not lock_acquired:
+            return {
+                "finalized": False,
+                "sent_round_number": None,
+                "skipped_reason": (
+                    "Action lock already exists. Duplicate negotiation "
+                    "round prevented."
+                ),
+            }
+
+        # Deferred import: app.services.simple_chat_service imports
+        # record_negotiation_supplier_message from this module at module
+        # load time, so importing it back at module level here would
+        # create a circular import. Importing inside the function body
+        # avoids that; both modules are already fully loaded by the time
+        # this function actually runs.
+        from app.services.simple_chat_service import (
+            send_or_display_outbound_message,
+        )
+
+        message_result = write_buyer_message(
+            intent=round_plan.llm_intent,
+            case_data=case_data,
+            supplier=supplier,
+            message_history=repo.list_messages_for_case_supplier(
+                case_id=case_id,
+                supplier_id=supplier_id,
+            ),
+            target_price_usd=round_plan.requested_price_usd,
+            supplier_best_price_usd=effective_best_price,
+            extra_context=round_plan.extra_context,
+        )
+
+        send_result = send_or_display_outbound_message(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            body=message_result["message"],
+            message_type="price_reduction_request",
+        )
+
+        delivery = send_result.get("send_result")
+        real_send_failed = (
+            send_result.get("send_real_message")
+            and (
+                delivery is None
+                or not delivery.get("success", False)
+            )
+        )
+
+        if real_send_failed:
+            repo.release_action_lock(
+                case_id=case_id,
+                supplier_id=supplier_id,
+                action_key=action_key,
+            )
+
+            return {
+                "finalized": False,
+                "sent_round_number": None,
+                "skipped_reason": (
+                    "Next negotiation round was generated, but real "
+                    "delivery failed. Supplier state was not advanced."
+                ),
+            }
+
+        repo.record_negotiation_round_sent(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            strategy=round_plan.strategy,
+            requested_price_usd=round_plan.requested_price_usd,
+        )
+
+        repo.set_supplier_policy_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.DISCOUNT_REQUEST_SENT.value,
+            best_offer_usd=effective_best_price,
+            target_price_usd=target_price_usd,
+        )
+
+        repo.log_worker_event(
+            case_id=case_id,
+            event_type="negotiation_round_sent",
+            details=(
+                f"Negotiation round {next_round_number} "
+                f"({round_plan.strategy}) sent to supplier ID "
+                f"{supplier_id}. {finalize_reason}"
+            ),
+        )
+
+        return {
+            "finalized": False,
+            "sent_round_number": next_round_number,
+        }
+
     if action == "PAUSE_FOR_REVIEW":
         return pause_for_review(
             review_type="common_negotiation_review",
             reason=common_decision.reason,
         )
+
+    if action == "STOP_NEGOTIATION_HARD":
+        repo.update_negotiation_state_after_inbound(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            last_inbound_at=inbound_at,
+            best_offer_usd=previous_best_price,
+        )
+
+        repo.record_negotiation_hard_stop(
+            case_id=case_id,
+            supplier_id=supplier_id,
+        )
+
+        repo.set_supplier_policy_state(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            state=SupplierState.FINAL_OFFER_RECEIVED.value,
+            best_offer_usd=previous_best_price,
+            target_price_usd=target_price_usd,
+        )
+
+        repo.log_worker_event(
+            case_id=case_id,
+            event_type="supplier_requested_hard_stop",
+            details=(
+                f"Supplier ID {supplier_id} explicitly asked to stop "
+                "price negotiation. Automated negotiation ended "
+                "immediately. Best historical offer retained: USD "
+                f"{previous_best_price if previous_best_price is not None else 0:.2f}."
+            ),
+        )
+
+        case_completed = (
+            _finish_case_if_all_negotiation_replies_received(
+                case_id
+            )
+        )
+
+        return {
+            "inbound_message_id": inbound_message_id,
+            "analysis": analysis,
+            "classification": analysis,
+            "common_decision": {
+                "action": common_decision.action,
+                "unit_price_usd": (
+                    common_decision.unit_price_usd
+                ),
+                "reason": common_decision.reason,
+            },
+            "extraction": None,
+            "saved_offer_id": None,
+            "review_item_id": None,
+            "supplier_state": (
+                SupplierState.FINAL_OFFER_RECEIVED.value
+            ),
+            "case_completed": case_completed,
+        }
 
     if action == "SAVE_OFFER":
         unit_price_usd = analysis.get(
@@ -389,39 +647,56 @@ def record_negotiation_supplier_message(
             best_offer_usd=effective_best_price,
         )
 
-        repo.set_supplier_policy_state(
-            case_id=case_id,
-            supplier_id=supplier_id,
-            state=(
-                SupplierState
-                .FINAL_OFFER_RECEIVED
-                .value
-            ),
-            best_offer_usd=effective_best_price,
-            target_price_usd=target_price_usd,
+        target_reached = (
+            new_price <= target_price_usd + _PRICE_TOLERANCE
         )
 
-        repo.log_worker_event(
-            case_id=case_id,
-            event_type=(
-                "supplier_final_offer_recorded"
-            ),
-            details=(
-                f"Supplier ID {supplier_id} final offer "
-                f"recorded: USD {new_price:.2f}. "
-                f"Effective supplier best: USD "
-                f"{effective_best_price:.2f}. "
-                f"Classifier category: "
-                f"{analysis['message_category']}. "
-                f"Common policy: "
-                f"{common_decision.action}."
-            ),
-        )
+        if target_reached:
+            # Target accepted (or bettered): save the offer and stop
+            # negotiation immediately, regardless of rounds remaining.
+            repo.set_supplier_policy_state(
+                case_id=case_id,
+                supplier_id=supplier_id,
+                state=(
+                    SupplierState
+                    .FINAL_OFFER_RECEIVED
+                    .value
+                ),
+                best_offer_usd=effective_best_price,
+                target_price_usd=target_price_usd,
+            )
+
+            repo.log_worker_event(
+                case_id=case_id,
+                event_type="supplier_accepted_target",
+                details=(
+                    f"Supplier ID {supplier_id} accepted the target "
+                    f"price. Final offer: USD {effective_best_price:.2f}."
+                ),
+            )
+
+            continuation = {"finalized": True, "sent_round_number": None}
+        else:
+            # Improved, but still above target: continue negotiating if
+            # rounds remain, otherwise finalize with the best price seen.
+            continuation = continue_or_finalize_negotiation(
+                effective_best_price=effective_best_price,
+                finalize_reason=(
+                    f"Supplier improved to USD {new_price:.2f}, still "
+                    f"above target USD {target_price_usd:.2f}."
+                ),
+            )
 
         case_completed = (
             _finish_case_if_all_negotiation_replies_received(
                 case_id
             )
+        )
+
+        supplier_state_value = (
+            SupplierState.FINAL_OFFER_RECEIVED.value
+            if continuation["finalized"]
+            else SupplierState.DISCOUNT_REQUEST_SENT.value
         )
 
         return {
@@ -454,15 +729,30 @@ def record_negotiation_supplier_message(
             },
             "saved_offer_id": saved_offer_id,
             "review_item_id": None,
-            "supplier_state": (
-                SupplierState
-                .FINAL_OFFER_RECEIVED
-                .value
-            ),
+            "supplier_state": supplier_state_value,
             "case_completed": case_completed,
+            "negotiation_continuation": continuation,
         }
 
     if action == "RECORD_PRICE_REFUSAL":
+        refusal_category = analysis.get("message_category")
+        refusal_strength = (
+            refusal_category
+            if refusal_category in {"SOFT_REFUSAL", "FIRM_REFUSAL"}
+            # Legacy/general PRICE_REFUSAL (or the common-reply-policy
+            # fallback's "same price repeated" case) has no strength
+            # distinction from the classifier. Default to SOFT: it is the
+            # more permissive assumption and keeps negotiation going
+            # rather than silently treating an ordinary refusal as firm.
+            else "SOFT_REFUSAL"
+        )
+
+        repo.record_negotiation_refusal(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            refusal_strength=refusal_strength,
+        )
+
         repo.update_negotiation_state_after_inbound(
             case_id=case_id,
             supplier_id=supplier_id,
@@ -470,36 +760,36 @@ def record_negotiation_supplier_message(
             best_offer_usd=previous_best_price,
         )
 
-        repo.set_supplier_policy_state(
-            case_id=case_id,
-            supplier_id=supplier_id,
-            state=(
-                SupplierState
-                .FINAL_OFFER_RECEIVED
-                .value
+        continuation = continue_or_finalize_negotiation(
+            effective_best_price=previous_best_price,
+            finalize_reason=(
+                f"Supplier refusal recorded ({refusal_strength}). Best "
+                f"known offer retained: USD {previous_best_price:.2f}."
             ),
-            best_offer_usd=previous_best_price,
-            target_price_usd=target_price_usd,
         )
 
-        repo.log_worker_event(
-            case_id=case_id,
-            event_type=(
-                "supplier_price_reduction_refused"
-            ),
-            details=(
-                f"Supplier ID {supplier_id} did not "
-                f"improve the existing offer. Existing best "
-                f"offer USD {previous_best_price} retained. "
-                f"Common policy: "
-                f"{common_decision.action}."
-            ),
-        )
+        if not continuation["finalized"]:
+            repo.log_worker_event(
+                case_id=case_id,
+                event_type="supplier_price_reduction_refused",
+                details=(
+                    f"Supplier ID {supplier_id} did not improve the "
+                    f"existing offer ({refusal_strength}). Existing best "
+                    f"offer USD {previous_best_price} retained. Common "
+                    f"policy: {common_decision.action}."
+                ),
+            )
 
         case_completed = (
             _finish_case_if_all_negotiation_replies_received(
                 case_id
             )
+        )
+
+        supplier_state_value = (
+            SupplierState.FINAL_OFFER_RECEIVED.value
+            if continuation["finalized"]
+            else SupplierState.DISCOUNT_REQUEST_SENT.value
         )
 
         return {
@@ -516,12 +806,9 @@ def record_negotiation_supplier_message(
             "extraction": None,
             "saved_offer_id": None,
             "review_item_id": None,
-            "supplier_state": (
-                SupplierState
-                .FINAL_OFFER_RECEIVED
-                .value
-            ),
+            "supplier_state": supplier_state_value,
             "case_completed": case_completed,
+            "negotiation_continuation": continuation,
         }
 
     if action == "WAIT_FOR_SUPPLIER":
