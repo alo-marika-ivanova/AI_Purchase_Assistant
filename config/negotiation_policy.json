@@ -21,6 +21,7 @@
   "max_discount_requests_per_supplier": 2,
   "max_negotiation_reminders_per_supplier": 1,
   "max_outbound_without_supplier_reply": 2,
+  "max_negotiation_rounds_per_supplier": 4,
 
   "pause_on_unknown_or_risky_topic": true
 }

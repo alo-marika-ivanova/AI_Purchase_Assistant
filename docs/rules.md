@@ -120,7 +120,13 @@ Provisional offers must not be included in these calculations.
 * The system must not reveal the names of competing suppliers.
 * The system may state that better market offers are available.
 * The system asks whether the supplier can reach the target price or move closer to it.
-* Each supplier may receive no more than **two negotiation messages** after submitting the first valid confirmed offer.
+* Each supplier may receive no more than **four negotiation messages** after submitting the first valid confirmed offer. This is persistent but controlled negotiation: an ordinary refusal does not end the conversation while rounds remain.
+* Each of the four negotiation messages uses a distinct strategy:
+
+  1. Request the target price.
+  2. Acknowledge the refusal and ask the supplier to check once more.
+  3. Express serious interest and request another concrete improvement.
+  4. Ask for the absolute best possible price before closing comparison.
 * The system must wait for the supplier’s response before sending another negotiation message.
 * The system must not repeatedly send messages while waiting for a response.
 
@@ -143,20 +149,26 @@ Example:
 
 ### Supplier Accepts the Target Price or a Lower Price
 
+* The offer is saved and negotiation stops immediately, regardless of how many negotiation rounds remain.
 * The supplier becomes a candidate for winner selection.
 * Ela confirms or rejects the proposed winner.
 
 ### Supplier Improves the Offer but Remains Above the Target
 
 * Store the improved offer.
-* If negotiation attempts remain, continue negotiating toward the target price.
-* If no attempts remain, store the supplier’s best offer for final evaluation.
+* If negotiation rounds remain, continue negotiating toward the target price using the next strategy.
+* If no rounds remain, store the supplier’s best offer for final evaluation.
 
 ### Supplier Refuses to Reduce the Price
 
-* Record the refusal.
-* If negotiation attempts remain, the system may send another negotiation message.
-* If all attempts have been used, store the supplier’s best offer for final evaluation.
+Refusals are classified into one of four categories. The LLM classifier has authority over this classification; deterministic regex logic only validates an already-successful classification (it may escalate a refusal to a hard stop when the text explicitly asks to stop, but never overrides the LLM otherwise) or acts as a fallback when the LLM call itself fails.
+
+* **Soft refusal** -- an ordinary, first-time bargaining refusal such as "this is our final price", "no more margin", or "we cannot reach your target". Does not end negotiation while rounds remain.
+* **Firm refusal** -- a repeated or notably stronger refusal that still does not ask to stop. Does not end negotiation while rounds remain.
+* **Hard stop** -- the supplier explicitly asks not to be negotiated with further (for example "please stop asking", "do not contact us again about price"). Ends automated negotiation immediately, regardless of rounds remaining. This is a fully automatic outcome and does not require Ela’s review.
+* **Supply unavailable** -- the supplier states they cannot or will not supply the item at all, independent of price. The supplier is marked rejected; no further negotiation is attempted.
+
+For a soft or firm refusal: record the refusal and, if negotiation rounds remain, send the next negotiation message. If all four rounds have been used, retain the best historical (lowest) offer ever recorded for that supplier and finalize.
 
 ### Supplier Does Not Respond During Negotiation
 
@@ -279,7 +291,7 @@ The following actions require Ela’s confirmation or intervention:
 * RFQ reminder after: **1 business day**
 * RFQ closed without response after: **2 business days**
 * Target price: **10% below the best confirmed offer**
-* Maximum negotiation messages per supplier: **2**
+* Maximum negotiation messages per supplier: **4** (persistent but controlled negotiation; see Section 6)
 * Negotiation follow-up after: **1 business day**
 * Maximum AI messages without a supplier response: **2**
 * Acceptable tolerance above target price: **5%**
@@ -290,7 +302,7 @@ The following actions require Ela’s confirmation or intervention:
 * RFQ reminder after: **2 minutes**
 * RFQ closed without response after: **4 minutes**
 * Target price: **10% below the best confirmed offer**
-* Maximum negotiation messages per supplier: **2**
+* Maximum negotiation messages per supplier: **4** (persistent but controlled negotiation; see Section 6)
 * Negotiation follow-up after: **2 minutes**
 * Maximum AI messages without a supplier response: **2**
 * Acceptable tolerance above target price: **5%**

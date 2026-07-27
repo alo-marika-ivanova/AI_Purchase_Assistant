@@ -1702,6 +1702,79 @@ class PurchasingRepository:
             )
             conn.commit()
 
+    def record_negotiation_round_sent(
+        self,
+        case_id: int,
+        supplier_id: int,
+        strategy: str,
+        requested_price_usd: float,
+    ) -> None:
+        """
+        Record that one negotiation-round message was sent.
+
+        Increments the round counter, marks the supplier as awaiting a
+        reply, and persists which strategy/price was used so this
+        information survives a worker or app restart.
+        """
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE supplier_negotiation_state
+                SET
+                    negotiation_attempts = negotiation_attempts + 1,
+                    awaiting_supplier_reply = 1,
+                    last_negotiation_strategy = ?,
+                    last_requested_price_usd = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE case_id = ?
+                  AND supplier_id = ?
+                """,
+                (strategy, requested_price_usd, case_id, supplier_id),
+            )
+            conn.commit()
+
+    def record_negotiation_refusal(
+        self,
+        case_id: int,
+        supplier_id: int,
+        refusal_strength: str,
+    ) -> None:
+        """Persist the strength of the supplier's most recent refusal."""
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE supplier_negotiation_state
+                SET
+                    refusal_strength = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE case_id = ?
+                  AND supplier_id = ?
+                """,
+                (refusal_strength, case_id, supplier_id),
+            )
+            conn.commit()
+
+    def record_negotiation_hard_stop(
+        self,
+        case_id: int,
+        supplier_id: int,
+    ) -> None:
+        """Persist that the supplier explicitly asked to stop negotiating."""
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE supplier_negotiation_state
+                SET
+                    hard_stop = 1,
+                    refusal_strength = 'HARD_STOP',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE case_id = ?
+                  AND supplier_id = ?
+                """,
+                (case_id, supplier_id),
+            )
+            conn.commit()
+
     def close_negotiation_for_case(self, case_id: int) -> None:
         """
         Mark all supplier negotiation states as closed.
@@ -3660,6 +3733,12 @@ class PurchasingRepository:
                     state,
                     best_offer_usd,
                     target_price_usd,
+                    negotiation_attempts,
+                    awaiting_supplier_reply,
+                    last_negotiation_strategy,
+                    last_requested_price_usd,
+                    refusal_strength,
+                    hard_stop,
                     updated_at
                 FROM supplier_negotiation_state
                 WHERE case_id = ?

@@ -17,6 +17,11 @@ from app.llm.rfq_tentative_price_safeguard import (
     extract_tentative_rfq_unit_price,
     is_contextual_provisional_price_confirmation,
 )
+from app.llm.negotiation_refusal_safeguard import (
+    build_deterministic_refusal_result,
+    classify_refusal_strength_by_regex,
+    text_requests_hard_stop,
+)
 from app.llm.supplier_message_analysis import add_structured_dimensions
 
 
@@ -49,6 +54,10 @@ MESSAGE_CATEGORIES = {
     "SUPPLIER_QUESTION",
     "DECLINES_OR_UNAVAILABLE",
     "PRICE_REFUSAL",
+    "SOFT_REFUSAL",
+    "FIRM_REFUSAL",
+    "HARD_STOP",
+    "SUPPLY_UNAVAILABLE",
     "PAYMENT_TERMS",
     "DEPOSIT_OR_PREPAYMENT",
     "CASH_PAYMENT",
@@ -72,6 +81,7 @@ RECOMMENDED_ACTIONS = {
     "ANSWER_FROM_CASE_AND_REPEAT_REQUEST",
     "MARK_REJECTED",
     "RECORD_PRICE_REFUSAL",
+    "STOP_NEGOTIATION_HARD",
     "PAUSE_FOR_REVIEW",
 }
 
@@ -124,6 +134,8 @@ NO_PRICE_FACT_CATEGORIES = {
     "ACKNOWLEDGEMENT_WILL_REPLY",
     "SUPPLIER_QUESTION",
     "DECLINES_OR_UNAVAILABLE",
+    "HARD_STOP",
+    "SUPPLY_UNAVAILABLE",
     "PAYMENT_TERMS",
     "DEPOSIT_OR_PREPAYMENT",
     "CASH_PAYMENT",
@@ -463,6 +475,23 @@ def _normalize_result(
     elif category == "PRICE_REFUSAL":
         action = "RECORD_PRICE_REFUSAL"
         requires_human_review = False
+    elif category in {"SOFT_REFUSAL", "FIRM_REFUSAL"}:
+        # Ordinary or repeated/strong bargaining refusals. Neither ends
+        # negotiation by itself; app/services/negotiation_reply_service.py
+        # decides whether to continue based on remaining negotiation rounds.
+        action = "RECORD_PRICE_REFUSAL"
+        requires_human_review = False
+    elif category == "HARD_STOP":
+        # Supplier explicitly asked not to be negotiated with further.
+        # This ends automated negotiation immediately, but is an expected,
+        # fully-automatable outcome, not a human-review trigger.
+        action = "STOP_NEGOTIATION_HARD"
+        requires_human_review = False
+    elif category == "SUPPLY_UNAVAILABLE":
+        # Supplier cannot or will not supply the item at all. Handled the
+        # same way as DECLINES_OR_UNAVAILABLE.
+        action = "MARK_REJECTED"
+        requires_human_review = False
     elif category == "SUPPLIER_QUESTION":
         if question_can_be_answered_from_case:
             action = "ANSWER_FROM_CASE_AND_REPEAT_REQUEST"
@@ -511,6 +540,7 @@ def _normalize_result(
         "ANSWER_FROM_CASE_AND_REPEAT_REQUEST",
         "MARK_REJECTED",
         "RECORD_PRICE_REFUSAL",
+        "STOP_NEGOTIATION_HARD",
     }
 
     if not reason:
@@ -665,8 +695,25 @@ Important negotiation rules:
   TARGET_ACCEPTANCE even if the reply does not repeat the number.
 - A new clear price below the supplier's previous offer but above target is
   IMPROVED_PRICE_OFFER.
-- "We cannot reduce", "our previous price is final", "no", or equivalent is
-  PRICE_REFUSAL.
+- During NEGOTIATION, classify a price refusal into exactly one of these four
+  categories (persistent but controlled negotiation depends on getting this
+  distinction right):
+  - SOFT_REFUSAL: an ordinary, first-time bargaining refusal with no request
+    to stop, for example "this is our final price", "we have no more margin",
+    or "we cannot reach your target". This is the default refusal category.
+  - FIRM_REFUSAL: the supplier is repeating a refusal already given earlier in
+    this conversation, or uses notably stronger/more emphatic language
+    ("absolutely not", "definitely final", "no margin whatsoever"), but still
+    does not ask to stop being contacted about price.
+  - HARD_STOP: the supplier explicitly asks not to be asked again, e.g.
+    "please stop asking", "do not contact us again about the price", "this
+    discussion is closed". Use this only when the request to stop is
+    explicit, not merely implied by a strong refusal.
+  - SUPPLY_UNAVAILABLE: the supplier states they cannot or will not supply
+    the requested item at all (out of stock, discontinued, no longer able to
+    supply), independent of price.
+  None of SOFT_REFUSAL or FIRM_REFUSAL means negotiation must stop; only
+  HARD_STOP does. Look at the recent conversation to tell SOFT from FIRM.
 - "We will check and reply tomorrow" with no price is ACKNOWLEDGEMENT_WILL_REPLY.
 - If the supplier states one price but says it is uncertain or still needs internal
   verification, use TENTATIVE_PRICE and SAVE_PROVISIONAL_OFFER_AND_WAIT. Uncertainty
@@ -790,7 +837,7 @@ Return exactly one JSON object with these keys:
             temperature=0.0,
         )
         parsed = extract_json_object(raw_text)
-        return _normalize_result(
+        result = _normalize_result(
             parsed=parsed,
             conversation_stage=conversation_stage,
             target_price_usd=target_price_usd,
@@ -798,6 +845,31 @@ Return exactly one JSON object with these keys:
             model_name=provider.model,
             provisional_price_usd=provisional_price_usd,
         )
+
+        # Escalate-only safety net: the LLM has authority over refusal
+        # classification, but if it returned an ordinary/firm refusal while
+        # the raw text unambiguously asks to stop negotiating, upgrade to
+        # HARD_STOP rather than silently under-reacting to an explicit
+        # buyer-facing request. Never downgrades or overrides anything else.
+        if (
+            (conversation_stage or "").strip().upper() == "NEGOTIATION"
+            and result.get("message_category")
+            in {"PRICE_REFUSAL", "SOFT_REFUSAL", "FIRM_REFUSAL"}
+            and text_requests_hard_stop(clean_body)
+        ):
+            result = {
+                **result,
+                "message_category": "HARD_STOP",
+                "recommended_action": "STOP_NEGOTIATION_HARD",
+                "requires_human_review": False,
+                "reason": (
+                    f"{result.get('reason', '')} Escalated to HARD_STOP: "
+                    "the message also contains an explicit request to stop "
+                    "price negotiation."
+                ).strip(),
+            }
+
+        return result
     except Exception as exc:
         fallback_provider_name = (
             provider.name
@@ -805,6 +877,12 @@ Return exactly one JSON object with these keys:
             else os.getenv("LLM_PROVIDER", "claude").strip().lower()
         )
         fallback_model_name = provider.model if provider is not None else None
+
+        if (conversation_stage or "").strip().upper() == "NEGOTIATION":
+            fallback_category = classify_refusal_strength_by_regex(clean_body)
+            if fallback_category is not None:
+                return build_deterministic_refusal_result(fallback_category)
+
         return _failure_result(
             str(exc),
             provider_name=fallback_provider_name,

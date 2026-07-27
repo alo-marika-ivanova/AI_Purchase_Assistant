@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+# Persistent but controlled negotiation: up to
+# policy.max_negotiation_rounds_per_supplier price-negotiation requests may be
+# sent per supplier. Each round uses a distinct strategy/tone, but always
+# requests the same case target price -- this module decides the strategy
+# and the requested price deterministically; app/llm/communication_writer.py
+# only phrases the chosen strategy, it does not choose what to ask for.
+
+STRATEGY_REQUEST_TARGET = "REQUEST_TARGET"
+STRATEGY_ACKNOWLEDGE_AND_RECHECK = "ACKNOWLEDGE_AND_RECHECK"
+STRATEGY_EXPRESS_INTEREST_REQUEST_IMPROVEMENT = (
+    "EXPRESS_INTEREST_REQUEST_IMPROVEMENT"
+)
+STRATEGY_ASK_ABSOLUTE_BEST = "ASK_ABSOLUTE_BEST"
+
+_STRATEGY_BY_ROUND = {
+    1: STRATEGY_REQUEST_TARGET,
+    2: STRATEGY_ACKNOWLEDGE_AND_RECHECK,
+    3: STRATEGY_EXPRESS_INTEREST_REQUEST_IMPROVEMENT,
+    4: STRATEGY_ASK_ABSOLUTE_BEST,
+}
+
+_INTENT_BY_STRATEGY = {
+    STRATEGY_REQUEST_TARGET: "ask_for_target_price",
+    STRATEGY_ACKNOWLEDGE_AND_RECHECK: "acknowledge_refusal_and_recheck_target",
+    STRATEGY_EXPRESS_INTEREST_REQUEST_IMPROVEMENT: (
+        "express_interest_request_improvement"
+    ),
+    STRATEGY_ASK_ABSOLUTE_BEST: "ask_absolute_best_price",
+}
+
+
+@dataclass(frozen=True)
+class NegotiationRoundPlan:
+    """One deterministically chosen negotiation round.
+
+    ``requested_price_usd`` is always the case's fixed target price -- the
+    strategies differ in tone/framing across rounds, not in what number is
+    asked for.
+    """
+
+    round_number: int
+    strategy: str
+    llm_intent: str
+    requested_price_usd: float
+    extra_context: str
+
+
+def strategy_for_round(round_number: int) -> str:
+    """Return the strategy identifier for a given negotiation round (1-4)."""
+    if round_number not in _STRATEGY_BY_ROUND:
+        raise ValueError(
+            f"No negotiation strategy is defined for round {round_number}."
+        )
+    return _STRATEGY_BY_ROUND[round_number]
+
+
+def intent_for_strategy(strategy: str) -> str:
+    """Return the communication-writer intent for a strategy."""
+    if strategy not in _INTENT_BY_STRATEGY:
+        raise ValueError(f"Unknown negotiation strategy: {strategy!r}")
+    return _INTENT_BY_STRATEGY[strategy]
+
+
+def _extra_context_for_round(
+    round_number: int,
+    target_price_usd: float,
+    supplier_best_price_usd: float,
+) -> str:
+    target_text = f"{target_price_usd:.2f}"
+    current_text = f"{supplier_best_price_usd:.2f}"
+
+    if round_number == 1:
+        return (
+            f"The supplier's own current offer is USD {current_text} per "
+            f"unit. Ask specifically whether they can reach USD "
+            f"{target_text} per unit. This is the first price-negotiation "
+            "message. Keep it concise, natural, commercially firm, and "
+            "polite. Do not say that an order is confirmed. Do not invent "
+            "a deadline or other conditions."
+        )
+
+    if round_number == 2:
+        return (
+            f"The supplier declined the target price of USD {target_text} "
+            "per unit. Acknowledge their previous answer politely, and ask "
+            "them to check once more (for example with their supplier or "
+            f"management) whether USD {target_text} per unit is possible "
+            "after all. Do not sound pushy or repeat the exact same "
+            "wording as before. Do not invent new facts or deadlines."
+        )
+
+    if round_number == 3:
+        return (
+            "The supplier has declined the target price more than once. "
+            "Express genuine interest in working with them and ask for "
+            f"one more concrete price improvement toward USD {target_text} "
+            "per unit. Make clear this is an important opportunity for "
+            "them, without promising a guaranteed order or naming "
+            "competitors."
+        )
+
+    if round_number == 4:
+        return (
+            "This is the final price-negotiation message with this "
+            "supplier before finalizing the comparison. Ask for their "
+            "absolute best possible final USD unit price. Make clear this "
+            "is the last opportunity to improve the offer before a "
+            "decision is made. Do not disclose competitor names or "
+            "prices, and do not promise a guaranteed order."
+        )
+
+    raise ValueError(f"No negotiation strategy is defined for round {round_number}.")
+
+
+def plan_negotiation_round(
+    round_number: int,
+    target_price_usd: float,
+    supplier_best_price_usd: float,
+) -> NegotiationRoundPlan:
+    """Deterministically choose the strategy, intent, and requested price
+    for one negotiation round. The communication writer only phrases this
+    plan; it must not change the strategy or the requested price."""
+    strategy = strategy_for_round(round_number)
+
+    return NegotiationRoundPlan(
+        round_number=round_number,
+        strategy=strategy,
+        llm_intent=intent_for_strategy(strategy),
+        requested_price_usd=float(target_price_usd),
+        extra_context=_extra_context_for_round(
+            round_number=round_number,
+            target_price_usd=float(target_price_usd),
+            supplier_best_price_usd=float(supplier_best_price_usd),
+        ),
+    )
