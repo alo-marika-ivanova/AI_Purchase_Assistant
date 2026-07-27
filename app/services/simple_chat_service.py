@@ -18,6 +18,11 @@ from app.services.transport_delivery_service import (
 )
 from app.negotiation.rfq_rules import RfqRuleAction, plan_rfq_stage_actions
 from app.negotiation.actions import NegotiationAction, NegotiationActionType
+from app.negotiation.business_time import compute_next_reminder_due_at
+from app.negotiation.negotiation_engine import plan_negotiation_reminder
+from app.negotiation.negotiation_reminder_rules import (
+    plan_negotiation_reminder_actions,
+)
 from app.negotiation.negotiation_rules import plan_initial_target_price_actions
 from app.negotiation.states import CaseState, SupplierState
 from app.negotiation.supplier_message_policy import (
@@ -404,6 +409,17 @@ def apply_deferred_delivery_side_effects(message_id: int) -> None:
         repo.increment_negotiation_attempt(
             case_id=case_id,
             supplier_id=supplier_id,
+        )
+        # The round itself was already recorded by the original caller
+        # before the transient failure; only the reminder clock (which
+        # only starts once delivery actually succeeds) still needs to be
+        # scheduled here.
+        repo.schedule_negotiation_reminder(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            next_reminder_due_at=compute_next_reminder_due_at(
+                load_negotiation_policy(), datetime.utcnow()
+            ).strftime("%Y-%m-%d %H:%M:%S"),
         )
         repo.log_worker_event(
             case_id=case_id,
@@ -1031,8 +1047,10 @@ def continue_negotiation_for_case(
 ) -> dict:
     """Advance one case through every immediately available workflow step.
 
-    A single call can both prepare the comparison and send the initial target
-    requests. Time-based reminders still happen on later worker cycles.
+    A single call can both prepare the comparison and send the initial
+    target requests. RFQ-stage reminders and negotiation-round
+    no-response reminders are both time-based and re-evaluated on every
+    call, so they naturally happen on later worker cycles once due.
     """
     case_data = repo.get_case_basic(case_id)
     if case_data is None:
@@ -1066,6 +1084,23 @@ def continue_negotiation_for_case(
         for action in actions:
             results.append(
                 execute_negotiation_rule_action(
+                    action=action,
+                    send_email=send_email,
+                    send_real_message=case_real_mode,
+                )
+            )
+
+    # Phase 3: for suppliers still awaiting a reply to a negotiation
+    # round, send a due no-response reminder or finalize an exhausted
+    # reminder sequence. Independent of Phase 2's initial requests --
+    # this runs on every cycle for any supplier already mid-negotiation.
+    case_data = repo.get_case_basic(case_id)
+    if case_data is not None and case_data.get("status") == CaseState.NEGOTIATING.value:
+        reminder_actions = plan_negotiation_reminder_actions(case_id)
+
+        for action in reminder_actions:
+            results.append(
+                execute_negotiation_reminder_action(
                     action=action,
                     send_email=send_email,
                     send_real_message=case_real_mode,
@@ -1452,9 +1487,14 @@ def execute_negotiation_rule_action(
         target_price_usd=float(action.target_price_usd),
     )
 
-    repo.increment_negotiation_attempt(
+    repo.record_negotiation_round_sent(
         case_id=action.case_id,
         supplier_id=action.supplier_id,
+        strategy="REQUEST_TARGET",
+        requested_price_usd=float(action.target_price_usd),
+        next_reminder_due_at=compute_next_reminder_due_at(
+            policy, datetime.utcnow()
+        ).strftime("%Y-%m-%d %H:%M:%S"),
     )
 
     repo.log_worker_event(
@@ -1480,6 +1520,228 @@ def execute_negotiation_rule_action(
         "supplier_best_price_usd": float(
             action.supplier_best_price_usd
         ),
+        "reason": action.reason,
+    }
+
+
+def execute_negotiation_reminder_action(
+    action: NegotiationAction,
+    send_email: bool = False,
+    send_real_message: bool = False,
+) -> dict:
+    """
+    Execute one no-response reminder for an unanswered negotiation round.
+
+    Mirrors execute_rfq_rule_action's SEND_RFQ_REMINDER handling: the
+    planner (plan_negotiation_reminder_actions) already decided a
+    reminder is due, but every guard is re-checked here against fresh
+    state immediately before sending, since Streamlit and the background
+    worker can process the same case concurrently. Reminders never touch
+    negotiation_attempts/last_negotiation_strategy -- they are a distinct
+    concern from persuasive negotiation rounds.
+    """
+    if (
+        action.action_type
+        != NegotiationActionType.SEND_NEGOTIATION_NO_RESPONSE_REMINDER
+    ):
+        raise ValueError(
+            f"Unsupported negotiation reminder action: {action.action_type}"
+        )
+
+    if action.supplier_id is None:
+        raise ValueError("Supplier ID is required.")
+
+    if action.target_price_usd is None:
+        raise ValueError("Target price is required.")
+
+    case_data = repo.get_case_basic(action.case_id)
+    if case_data is None:
+        raise ValueError("Case not found.")
+
+    def _skip(reason: str) -> dict:
+        return {
+            "action": action.action_type.value,
+            "supplier_id": action.supplier_id,
+            "skipped": True,
+            "reason": reason,
+        }
+
+    if case_data.get("status") != CaseState.NEGOTIATING.value:
+        return _skip(
+            "No-response reminder skipped because the case is not in "
+            "NEGOTIATING state."
+        )
+
+    state_row = repo.get_supplier_state(
+        case_id=action.case_id,
+        supplier_id=action.supplier_id,
+    )
+
+    if state_row is None:
+        return _skip("No-response reminder skipped: no supplier state row.")
+
+    if state_row["state"] != SupplierState.DISCOUNT_REQUEST_SENT.value:
+        return _skip(
+            "No-response reminder skipped because supplier state is "
+            f"{state_row['state']}, not DISCOUNT_REQUEST_SENT."
+        )
+
+    if not bool(state_row["awaiting_supplier_reply"]):
+        return _skip(
+            "No-response reminder skipped because the supplier is no "
+            "longer awaiting a reply -- a reply has already arrived."
+        )
+
+    if bool(state_row["hard_stop"]):
+        return _skip(
+            "No-response reminder skipped because the supplier issued a "
+            "hard stop."
+        )
+
+    open_reviews = repo.list_open_human_review_items_for_case(action.case_id)
+    if any(
+        int(item.get("supplier_id") or -1) == action.supplier_id
+        for item in open_reviews
+    ):
+        return _skip(
+            "No-response reminder skipped because a human-review item "
+            "is open for this supplier."
+        )
+
+    policy = load_negotiation_policy()
+
+    reminder_count = int(state_row.get("negotiation_reminder_count") or 0)
+
+    if reminder_count >= policy.max_negotiation_no_response_reminders:
+        return _skip(
+            "No-response reminder skipped because the reminder limit has "
+            "already been reached."
+        )
+
+    due_raw = state_row.get("next_negotiation_reminder_due_at")
+    due_at = None
+    if due_raw:
+        try:
+            due_at = datetime.fromisoformat(str(due_raw).replace("Z", ""))
+        except ValueError:
+            try:
+                due_at = datetime.strptime(str(due_raw), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                due_at = None
+
+    if due_at is None or datetime.utcnow() < due_at:
+        return _skip("No-response reminder skipped because it is not yet due.")
+
+    position = reminder_count + 1
+
+    action_key = (
+        f"SEND_NEGOTIATION_NO_RESPONSE_REMINDER:"
+        f"{action.supplier_id}:{position}"
+    )
+
+    lock_acquired = repo.acquire_action_lock(
+        case_id=action.case_id,
+        supplier_id=action.supplier_id,
+        action_key=action_key,
+        action_type="SEND_NEGOTIATION_NO_RESPONSE_REMINDER",
+    )
+
+    if not lock_acquired:
+        return _skip(
+            "Action lock already exists. Duplicate no-response reminder "
+            "prevented."
+        )
+
+    supplier = _find_case_supplier(
+        case_id=action.case_id,
+        supplier_id=action.supplier_id,
+    )
+
+    history = repo.list_messages_for_case_supplier(
+        case_id=action.case_id,
+        supplier_id=action.supplier_id,
+    )
+
+    reminder_plan = plan_negotiation_reminder(
+        position=position,
+        target_price_usd=float(action.target_price_usd),
+    )
+
+    message_result = write_buyer_message(
+        intent=reminder_plan.llm_intent,
+        case_data=case_data,
+        supplier=supplier,
+        message_history=history,
+        target_price_usd=reminder_plan.target_price_usd,
+        extra_context=reminder_plan.extra_context,
+    )
+
+    result = send_or_display_outbound_message(
+        case_id=action.case_id,
+        supplier_id=action.supplier_id,
+        body=message_result["message"],
+        message_type=action.message_type or "negotiation_no_response_reminder",
+        send_email=send_email,
+        send_real_message=send_real_message,
+    )
+
+    send_result = result.get("send_result")
+    real_send_failed = (
+        result.get("send_real_message")
+        and (
+            send_result is None
+            or not send_result.get("success", False)
+        )
+    )
+
+    if real_send_failed:
+        repo.release_action_lock(
+            case_id=action.case_id,
+            supplier_id=action.supplier_id,
+            action_key=action_key,
+        )
+
+        return {
+            "action": action.action_type.value,
+            "supplier": supplier["name"],
+            "message_id": result["message_id"],
+            "send_result": send_result,
+            "state_updated": False,
+            "reason": (
+                "No-response reminder was generated, but real delivery "
+                "failed. The reminder schedule was not advanced."
+            ),
+        }
+
+    repo.record_negotiation_reminder_sent(
+        case_id=action.case_id,
+        supplier_id=action.supplier_id,
+        reminder_count=position,
+        next_reminder_due_at=compute_next_reminder_due_at(
+            policy, datetime.utcnow()
+        ).strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+    repo.log_worker_event(
+        case_id=action.case_id,
+        event_type="negotiation_no_response_reminder_sent",
+        details=(
+            f"No-response reminder {position} of "
+            f"{policy.max_negotiation_no_response_reminders} "
+            f"({reminder_plan.strategy}) sent to supplier "
+            f"{supplier['name']}."
+        ),
+    )
+
+    return {
+        "action": action.action_type.value,
+        "supplier": supplier["name"],
+        "message_id": result["message_id"],
+        "message": message_result["message"],
+        "message_method": message_result.get("method"),
+        "send_result": send_result,
+        "state_updated": True,
+        "reminder_position": position,
         "reason": action.reason,
     }
 

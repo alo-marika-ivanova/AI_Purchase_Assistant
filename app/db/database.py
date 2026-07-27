@@ -59,6 +59,12 @@ _SUPPLIER_NEGOTIATION_STATE_MIGRATION_COLUMNS = {
     # further. Distinct from `closed` so the reason a supplier stopped
     # negotiating remains visible after the fact.
     "hard_stop": "INTEGER NOT NULL DEFAULT 0",
+    # No-response reminder tracking for the current, still-unanswered
+    # negotiation round. Reset to 0 / NULL whenever a reply arrives or a
+    # new round is sent (see repository.update_negotiation_state_after_inbound
+    # and repository.record_negotiation_round_sent).
+    "negotiation_reminder_count": "INTEGER NOT NULL DEFAULT 0",
+    "next_negotiation_reminder_due_at": "TEXT",
 }
 
 

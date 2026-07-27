@@ -1642,14 +1642,18 @@ class PurchasingRepository:
                     last_inbound_at,
                     best_offer_usd,
                     awaiting_supplier_reply,
+                    negotiation_reminder_count,
+                    next_negotiation_reminder_due_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, 0, 0, NULL, CURRENT_TIMESTAMP)
                 ON CONFLICT(case_id, supplier_id)
                 DO UPDATE SET
                     last_inbound_at = excluded.last_inbound_at,
                     best_offer_usd = ?,
                     awaiting_supplier_reply = 0,
+                    negotiation_reminder_count = 0,
+                    next_negotiation_reminder_due_at = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -1708,13 +1712,19 @@ class PurchasingRepository:
         supplier_id: int,
         strategy: str,
         requested_price_usd: float,
+        next_reminder_due_at: str | None = None,
     ) -> None:
         """
         Record that one negotiation-round message was sent.
 
         Increments the round counter, marks the supplier as awaiting a
         reply, and persists which strategy/price was used so this
-        information survives a worker or app restart.
+        information survives a worker or app restart. Also (re)starts the
+        no-response-reminder clock for this new round: the reminder count
+        resets to 0 and `next_reminder_due_at` schedules the first
+        reminder. Reminders are a separate concern from negotiation
+        rounds -- this method must never be called by reminder-sending
+        code, only when an actual persuasive negotiation message is sent.
         """
         with get_connection() as conn:
             conn.execute(
@@ -1725,11 +1735,82 @@ class PurchasingRepository:
                     awaiting_supplier_reply = 1,
                     last_negotiation_strategy = ?,
                     last_requested_price_usd = ?,
+                    negotiation_reminder_count = 0,
+                    next_negotiation_reminder_due_at = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE case_id = ?
                   AND supplier_id = ?
                 """,
-                (strategy, requested_price_usd, case_id, supplier_id),
+                (
+                    strategy,
+                    requested_price_usd,
+                    next_reminder_due_at,
+                    case_id,
+                    supplier_id,
+                ),
+            )
+            conn.commit()
+
+    def schedule_negotiation_reminder(
+        self,
+        case_id: int,
+        supplier_id: int,
+        next_reminder_due_at: str,
+    ) -> None:
+        """
+        (Re)start the no-response-reminder clock for the current round
+        without touching negotiation_attempts, strategy, or price.
+
+        Used only by the deferred-delivery reconciliation path in
+        app/services/simple_chat_service.py
+        (apply_deferred_delivery_side_effects), for a price_reduction_request
+        whose first send attempt failed transiently and only succeeded
+        later via automatic retry -- at that point the round was already
+        recorded, but its reminder clock still needs to start.
+        """
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE supplier_negotiation_state
+                SET
+                    negotiation_reminder_count = 0,
+                    next_negotiation_reminder_due_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE case_id = ?
+                  AND supplier_id = ?
+                """,
+                (next_reminder_due_at, case_id, supplier_id),
+            )
+            conn.commit()
+
+    def record_negotiation_reminder_sent(
+        self,
+        case_id: int,
+        supplier_id: int,
+        reminder_count: int,
+        next_reminder_due_at: str | None,
+    ) -> None:
+        """
+        Record that one no-response reminder was sent for the current,
+        still-unanswered negotiation round.
+
+        Deliberately does not touch negotiation_attempts or
+        last_negotiation_strategy/last_requested_price_usd -- a reminder
+        is not a new persuasive negotiation round.
+        """
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE supplier_negotiation_state
+                SET
+                    negotiation_reminder_count = ?,
+                    followup_sent_at = CURRENT_TIMESTAMP,
+                    next_negotiation_reminder_due_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE case_id = ?
+                  AND supplier_id = ?
+                """,
+                (reminder_count, next_reminder_due_at, case_id, supplier_id),
             )
             conn.commit()
 
@@ -3652,6 +3733,46 @@ class PurchasingRepository:
 
         return dict(row) if row else None
 
+    def get_latest_supplier_outbound_message_of_type(
+            self,
+            case_id: int,
+            supplier_id: int,
+            message_type: str,
+    ) -> dict | None:
+        """
+        Like get_latest_supplier_outbound_message, but scoped to one
+        message_type. Used to find when the current negotiation round's
+        persuasive message was sent, distinct from any reminder sent
+        afterward (a different message_type).
+        """
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    id,
+                    case_id,
+                    supplier_id,
+                    message_type,
+                    direction,
+                    channel,
+                    body,
+                    status,
+                    created_at,
+                    sent_at
+                FROM messages
+                WHERE case_id = ?
+                  AND supplier_id = ?
+                  AND direction = 'outbound'
+                  AND message_type = ?
+                  AND status <> 'send_failed'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (case_id, supplier_id, message_type),
+            ).fetchone()
+
+        return dict(row) if row else None
+
     def supplier_has_inbound_message(
             self,
             case_id: int,
@@ -3739,6 +3860,9 @@ class PurchasingRepository:
                     last_requested_price_usd,
                     refusal_strength,
                     hard_stop,
+                    negotiation_reminder_count,
+                    next_negotiation_reminder_due_at,
+                    followup_sent_at,
                     updated_at
                 FROM supplier_negotiation_state
                 WHERE case_id = ?
