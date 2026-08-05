@@ -103,6 +103,38 @@ def plan_initial_target_price_actions(
             )
             continue
 
+        item_targets = _item_targets_for_supplier(case_id, supplier_id)
+
+        if item_targets:
+            action_target_price_usd = min(
+                entry["target_price_usd"] for entry in item_targets
+            )
+            action_supplier_best_price_usd = next(
+                entry["best_price_usd"]
+                for entry in item_targets
+                if entry["target_price_usd"] == action_target_price_usd
+            )
+            item_summary = "; ".join(
+                f"{entry['item_material']}: current USD "
+                f"{entry['best_price_usd']:.2f}, target USD "
+                f"{entry['target_price_usd']:.2f}"
+                for entry in item_targets
+            )
+            reason = (
+                "Ask whether the supplier can reach each item's own "
+                f"target individually - {item_summary}."
+            )
+        else:
+            action_target_price_usd = target_price_usd
+            action_supplier_best_price_usd = supplier_best_price_usd
+            reason = (
+                f"Supplier's current offer is USD "
+                f"{supplier_best_price_usd:.2f} per unit. "
+                f"Ask whether the supplier can reach the "
+                f"common target of USD "
+                f"{target_price_usd:.2f} per unit."
+            )
+
         actions.append(
             NegotiationAction(
                 action_type=(
@@ -112,18 +144,44 @@ def plan_initial_target_price_actions(
                 supplier_id=supplier_id,
                 message_type="price_reduction_request",
                 llm_intent="ask_for_target_price",
-                target_price_usd=target_price_usd,
+                target_price_usd=action_target_price_usd,
                 supplier_best_price_usd=(
-                    supplier_best_price_usd
+                    action_supplier_best_price_usd
                 ),
-                reason=(
-                    f"Supplier's current offer is USD "
-                    f"{supplier_best_price_usd:.2f} per unit. "
-                    f"Ask whether the supplier can reach the "
-                    f"common target of USD "
-                    f"{target_price_usd:.2f} per unit."
-                ),
+                reason=reason,
+                item_targets=item_targets or None,
             )
         )
 
     return actions
+
+
+def _item_targets_for_supplier(
+    case_id: int, supplier_id: int
+) -> list[dict]:
+    """Per-item target/best-price breakdown for the items this supplier
+    was linked to, using the per-item negotiation context persisted by
+    prepare_case_for_negotiation. Legacy single-item cases have no
+    case_items, so this is always empty for them - callers must fall back
+    to the case-wide scalar target in that case."""
+    entries: list[dict] = []
+
+    for item in repo.list_case_items_for_supplier(case_id, supplier_id):
+        item_context = repo.get_case_item_negotiation_context(item["id"])
+        if item_context is None:
+            continue
+
+        entries.append(
+            {
+                "case_item_id": int(item["id"]),
+                "item_material": item["item_material"],
+                "best_price_usd": float(
+                    item_context["initial_best_offer_usd"]
+                ),
+                "target_price_usd": float(
+                    item_context["target_price_usd"]
+                ),
+            }
+        )
+
+    return entries

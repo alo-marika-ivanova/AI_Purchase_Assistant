@@ -180,6 +180,7 @@ def fallback_message(
     target_price_usd: float | None = None,
     supplier_best_price_usd: float | None = None,
     winning_price_usd: float | None = None,
+    item_targets: list[dict] | None = None,
 ) -> dict:
     """Safe supplier-specific fallback used when Ollama is unavailable."""
     supplier_name = supplier.get("name", "there")
@@ -190,8 +191,24 @@ def fallback_message(
     opening = _fallback_opening(supplier)
 
     note_text = f" Additional details: {notes}" if notes else ""
+    order_items = case_data.get("items")
 
-    if intent == "initial_rfq":
+    if intent == "initial_rfq" and order_items:
+        item_lines = "\n".join(
+            f"- {order_item['item_material']}: quantity {order_item['quantity']}"
+            for order_item in order_items
+        )
+        body = (
+            f"{opening} {supplier_name},\n\n"
+            "We have a requirement for the following item(s) and would like "
+            "your best USD unit price for each:\n\n"
+            f"{item_lines}\n\n"
+            f"Could you please confirm your unit prices?{note_text}\n\n"
+            "Best regards"
+        )
+        reason = "Fallback multi-item order RFQ."
+
+    elif intent == "initial_rfq":
         templates = (
             (
                 f"{opening} {supplier_name},\n\n"
@@ -270,6 +287,21 @@ def fallback_message(
             "Best regards"
         )
         reason = "Fallback case-information answer."
+
+    elif intent == "ask_for_target_price" and item_targets:
+        item_lines = "\n".join(
+            f"- {entry['item_material']}: current offer USD "
+            f"{_format_usd_price(entry['best_price_usd'])}, target USD "
+            f"{_format_usd_price(entry['target_price_usd'])} per unit"
+            for entry in item_targets
+        )
+        body = (
+            f"{opening} {supplier_name},\n\n"
+            "Thank you for your quotes. Could you let us know if you're "
+            f"able to reach the following per-unit targets:\n\n{item_lines}"
+            "\n\nBest regards"
+        )
+        reason = "Fallback multi-item target-price request."
 
     elif intent == "ask_for_target_price":
         if target_price_usd is None:
@@ -432,6 +464,7 @@ def write_buyer_message(
     winning_price_usd: float | None = None,
     extra_context: str = "",
     use_llm: bool | None = None,
+    item_targets: list[dict] | None = None,
 ) -> dict:
     """
     Generate a natural buyer message.
@@ -457,9 +490,56 @@ def write_buyer_message(
             target_price_usd=target_price_usd,
             supplier_best_price_usd=supplier_best_price_usd,
             winning_price_usd=winning_price_usd,
+            item_targets=item_targets,
         )
 
     history_text = _format_recent_history(message_history or [])
+
+    order_items = case_data.get("items")
+    items_block = ""
+    case_summary_lines = (
+        f"- Item/material: {case_data.get('item_material')}\n"
+        f"- Quantity: {case_data.get('quantity')}"
+    )
+
+    if order_items:
+        item_lines = "\n".join(
+            f"- {item['item_material']}: quantity {item['quantity']}"
+            for item in order_items
+        )
+        items_block = (
+            "\nItems THIS supplier should quote - ask for a unit price for "
+            "EACH one individually, not just a single overall price. Do "
+            "not mention any item, quantity, or total not listed here:\n"
+            f"{item_lines}\n"
+        )
+        # The case-level item_material/quantity describe the whole,
+        # multi-supplier order, not what this supplier was asked about -
+        # showing both to the LLM causes it to sometimes echo the wrong
+        # one, so the items list below is the only source of truth here.
+        case_summary_lines = (
+            "- This case is part of a larger multi-item order. Use ONLY "
+            "the 'Items this supplier should quote' list below - ignore "
+            "any other item name, quantity, or total."
+        )
+
+    if item_targets:
+        item_targets_lines = "\n".join(
+            f"- {entry['item_material']}: current offer USD "
+            f"{entry['best_price_usd']:.2f}, target USD "
+            f"{entry['target_price_usd']:.2f} per unit"
+            for entry in item_targets
+        )
+        price_context_block = (
+            "- Per-item targets - ask about EACH item individually and "
+            "state its own target explicitly, do not blend them into one "
+            f"shared number:\n{item_targets_lines}"
+        )
+    else:
+        price_context_block = (
+            f"- Supplier best price USD: {supplier_best_price_usd}\n"
+            f"- Target price USD: {target_price_usd}"
+        )
 
     prompt = f"""
 You write professional purchasing messages for a jewelry manufacturing buyer.
@@ -495,18 +575,16 @@ Intent:
 
 Case:
 - Case number: {case_data.get("case_number")}
-- Item/material: {case_data.get("item_material")}
-- Quantity: {case_data.get("quantity")}
+{case_summary_lines}
 - Notes: {case_data.get("notes") or ""}
-
+{items_block}
 Supplier:
 - Name: {supplier.get("name")}
 - Code: {supplier.get("supplier_code")}
 - Supplier-specific style: {_supplier_style_hint(supplier)}
 
 Price context:
-- Supplier best price USD: {supplier_best_price_usd}
-- Target price USD: {target_price_usd}
+{price_context_block}
 - Winning price USD: {winning_price_usd}
 
 Extra context:
@@ -538,7 +616,18 @@ Return JSON only in this exact format:
             parsed.get("reason")
         )
 
-        if intent == "ask_for_target_price":
+        if intent == "ask_for_target_price" and item_targets:
+            for entry in item_targets:
+                if not _message_mentions_target_price(
+                    message=message,
+                    target_price_usd=entry["target_price_usd"],
+                ):
+                    raise ValueError(
+                        "LLM multi-item negotiation message omitted the "
+                        f"explicit target price for {entry['item_material']}."
+                    )
+
+        elif intent == "ask_for_target_price":
             if target_price_usd is None:
                 raise ValueError(
                     "Target price is required for "
@@ -599,6 +688,7 @@ Return JSON only in this exact format:
             target_price_usd=target_price_usd,
             supplier_best_price_usd=supplier_best_price_usd,
             winning_price_usd=winning_price_usd,
+            item_targets=item_targets,
         )
 
         fallback["method"] = "fallback_after_llm_provider_failed"

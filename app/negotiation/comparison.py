@@ -20,6 +20,61 @@ def _round_money(value: Decimal) -> float:
     )
 
 
+def _prepare_case_item_negotiation_contexts(
+    case_id: int,
+    discount_fraction: Decimal,
+    target_discount_percent: float,
+) -> None:
+    """Persist a per-item negotiation target for every case_item that
+    already has at least one active offer, using the same
+    target-discount-percent formula as the case-wide target above, applied
+    to that item's own best offer instead of a blended case-wide one.
+
+    An order-case's items can have genuinely different market prices (e.g.
+    two different stones); a single case-wide target is only meaningful
+    when the case has one implicit item, which is exactly the legacy
+    (no case_items) shape that continues to rely on
+    case_negotiation_context above, untouched. Items with zero offers so
+    far are skipped - there is nothing to compute a target from yet, and a
+    later re-run of this function (should the case be re-prepared) fills
+    them in once an offer exists.
+    """
+    for item in repo.list_case_items(case_id):
+        item_offers = repo.list_best_offers_for_case_item(item["id"])
+        if not item_offers:
+            continue
+
+        best_item_offer = item_offers[0]
+        best_item_price = Decimal(str(best_item_offer["unit_price_usd"]))
+        item_target_price = _round_money(
+            best_item_price * (Decimal("1") - discount_fraction)
+        )
+
+        repo.upsert_case_item_negotiation_context(
+            case_item_id=int(item["id"]),
+            case_id=case_id,
+            initial_best_offer_usd=float(best_item_price),
+            target_price_usd=item_target_price,
+            best_supplier_id=int(best_item_offer["supplier_id"]),
+            best_offer_id=int(best_item_offer["offer_id"]),
+            valid_offer_count=len(item_offers),
+            target_discount_percent=target_discount_percent,
+            ranking_json=json.dumps(
+                [
+                    {
+                        "rank": rank,
+                        "offer_id": int(offer["offer_id"]),
+                        "supplier_id": int(offer["supplier_id"]),
+                        "supplier_name": offer["supplier_name"],
+                        "unit_price_usd": float(offer["unit_price_usd"]),
+                    }
+                    for rank, offer in enumerate(item_offers, start=1)
+                ],
+                ensure_ascii=False,
+            ),
+        )
+
+
 def prepare_case_for_negotiation(case_id: int) -> dict:
     """
     Build and persist the initial multi-supplier comparison.
@@ -112,6 +167,12 @@ def prepare_case_for_negotiation(case_id: int) -> dict:
             ),
             target_price_usd=target_price,
         )
+
+    _prepare_case_item_negotiation_contexts(
+        case_id=case_id,
+        discount_fraction=discount_fraction,
+        target_discount_percent=float(policy.target_discount_percent),
+    )
 
     repo.update_case_status_with_event(
         case_id=case_id,

@@ -40,14 +40,35 @@ def _has_usable_unit_price(analysis: dict) -> bool:
     )
 
 
+def _has_usable_item_offers(analysis: dict) -> bool:
+    """A multi-item order's reply carries its price(s) in item_offers, not
+    the single top-level unit_price_usd - that field is correctly left
+    empty/multi-valued for such a message, so it must not be treated as
+    "no usable price" the way it would for a single-item case."""
+    item_offers = analysis.get("item_offers")
+    return isinstance(item_offers, list) and len(item_offers) > 0
+
+
 def decide_supplier_message_policy(
     analysis: dict,
+    item_offers_fully_confirmed: bool = False,
 ) -> SupplierMessagePolicyDecision:
     """Convert semantic facts into an allowed workflow action.
 
     The LLM or deterministic analyzer interprets language. This policy function
     owns the business authority and therefore cannot be bypassed by an LLM's
     recommended action.
+
+    item_offers_fully_confirmed: for a multi-item order, True when every
+    item this supplier was asked to quote already has a resolved, CONFIRMED
+    per-item price (computed by the caller, which has the supplier's linked
+    items). The analyzer's whole-message recommended_action can otherwise
+    default to ASK_PRICE_CLARIFICATION out of single-item habit (treating
+    "more than one price in this message" as inherently ambiguous) even
+    though the per-item extraction already fully answered the request -
+    that whole-message field describes risk/refusal/hard-stop framing, not
+    per-item price clarity, so it must not override a complete per-item
+    result.
     """
     if (
         bool(analysis.get("requires_human_review"))
@@ -58,11 +79,23 @@ def decide_supplier_message_policy(
             reason="Risk or explicit human-review requirement has priority.",
         )
 
+    if item_offers_fully_confirmed:
+        return SupplierMessagePolicyDecision(
+            action="SAVE_OFFER",
+            reason=(
+                "Every item this supplier was asked to quote already has "
+                "a resolved, confirmed per-item price; the analyzer's "
+                "broader whole-message recommendation is not needed."
+            ),
+        )
+
     offer_status = str(analysis.get("offer_status") or "NONE").upper()
     price_certainty = str(
         analysis.get("price_certainty") or "NONE"
     ).upper()
-    usable_price = _has_usable_unit_price(analysis)
+    usable_price = _has_usable_unit_price(analysis) or _has_usable_item_offers(
+        analysis
+    )
 
     if offer_status == "PROVISIONAL" or price_certainty == "TENTATIVE":
         if usable_price:

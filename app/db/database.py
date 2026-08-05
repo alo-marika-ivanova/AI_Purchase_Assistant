@@ -35,6 +35,8 @@ def initialize_database() -> None:
     with get_connection() as conn:
         conn.executescript(schema_sql)
         _apply_additive_migrations(conn)
+        _apply_negotiation_cases_migrations(conn)
+        _apply_case_item_id_migrations(conn)
         conn.commit()
 
 
@@ -85,4 +87,40 @@ def _apply_additive_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE supplier_negotiation_state "
             f"ADD COLUMN {column_name} {column_definition}"
+        )
+
+
+def _apply_negotiation_cases_migrations(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(negotiation_cases)").fetchall()
+    }
+
+    # Links a case to the rfq_batches row it was created from, when it came
+    # from an uploaded RFQ file resolving to multiple items (one case per
+    # item). NULL for manually created single-item cases.
+    if "batch_id" not in existing_columns:
+        conn.execute("ALTER TABLE negotiation_cases ADD COLUMN batch_id INTEGER")
+
+
+def _apply_case_item_id_migrations(conn: sqlite3.Connection) -> None:
+    # Which specific order item (case_items row) an offer/winner decision
+    # applies to. NULL for a legacy single-item case, where the case itself
+    # is the only thing being priced.
+    #
+    # The index is created here, after the column is guaranteed to exist,
+    # rather than in schema.sql: schema.sql's executescript runs before this
+    # migration, so an index statement there would fail on a pre-existing
+    # database whose offers/winner_decisions tables predate this column.
+    for table in ("offers", "winner_decisions"):
+        existing_columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if "case_item_id" not in existing_columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN case_item_id INTEGER")
+
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table}_case_item_id "
+            f"ON {table}(case_item_id)"
         )

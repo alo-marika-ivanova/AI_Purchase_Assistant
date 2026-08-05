@@ -200,6 +200,58 @@ def _to_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _normalize_item_offers(
+    parsed: dict,
+    contains_risky_topic: bool,
+    category: str,
+) -> list[dict] | None:
+    """Validate the optional per-item price list for a multi-item order.
+
+    Only meaningful when the message actually carries pricing information;
+    a risk topic or a no-price category (refusal, hard stop, acknowledgement,
+    etc.) means there is nothing safe to attribute per item, mirroring how
+    those categories already clear the single-item price fields below.
+    """
+    raw_items = parsed.get("item_offers")
+    if not isinstance(raw_items, list) or not raw_items:
+        return None
+
+    if contains_risky_topic or category in NO_PRICE_FACT_CATEGORIES:
+        return None
+
+    cleaned: list[dict] = []
+    for entry in raw_items:
+        if not isinstance(entry, dict):
+            continue
+
+        item_material = _safe_text(entry.get("item_material"))
+        if not item_material:
+            continue
+
+        unit_price_usd = _nullable_float(entry.get("unit_price_usd"))
+        if unit_price_usd is None or unit_price_usd <= 0:
+            continue
+
+        price_certainty = _safe_text(entry.get("price_certainty")).upper()
+        if price_certainty not in {"TENTATIVE", "CONFIRMED"}:
+            # The model didn't specify per-item certainty - the overall
+            # message-level hedge (TENTATIVE_PRICE) most likely applies to
+            # every price it mentioned, so inherit from that.
+            price_certainty = (
+                "TENTATIVE" if category == "TENTATIVE_PRICE" else "CONFIRMED"
+            )
+
+        cleaned.append(
+            {
+                "item_material": item_material,
+                "unit_price_usd": unit_price_usd,
+                "price_certainty": price_certainty,
+            }
+        )
+
+    return cleaned or None
+
+
 def _apply_default_currency_rule(
     parsed: dict,
     conversation_stage: str,
@@ -546,6 +598,8 @@ def _normalize_result(
     if not reason:
         reason = "The supplier message was interpreted by the LLM classifier."
 
+    item_offers = _normalize_item_offers(parsed, contains_risky_topic, category)
+
     return add_structured_dimensions({
         "success": True,
         "provider": provider_name,
@@ -574,6 +628,7 @@ def _normalize_result(
         "supplier_commitment": parsed.get("supplier_commitment"),
         "pending_supplier_action": parsed.get("pending_supplier_action"),
         "offer_status": parsed.get("offer_status"),
+        "item_offers": item_offers,
         "reason": reason,
         "suggested_clarification_question": clarification,
         "suggested_buyer_reply": suggested_reply,
@@ -611,6 +666,7 @@ def _failure_result(
         "supplier_refused": False,
         "supplier_accepts_target": False,
         "question_can_be_answered_from_case": False,
+        "item_offers": None,
         "reason": "The LLM could not safely classify the supplier message.",
         "suggested_clarification_question": None,
         "suggested_buyer_reply": None,
@@ -639,7 +695,16 @@ def analyze_supplier_message_with_ollama(
             model_name=None,
         )
 
-    if (conversation_stage or "").strip().upper() == "RFQ":
+    order_items = case_data.get("items")
+    is_multi_item = isinstance(order_items, list) and len(order_items) > 1
+
+    # The deterministic regex safeguards below are single-price-only by
+    # construction (they bail if more than one number appears in the
+    # message). A genuine multi-item order is expected to mention several
+    # prices in one reply, so those safeguards would either misfire or
+    # reject a perfectly normal message - skip straight to the LLM, which
+    # is equipped to extract a price per item.
+    if (conversation_stage or "").strip().upper() == "RFQ" and not is_multi_item:
         if (
             provisional_price_usd is not None
             and provisional_price_usd > 0
@@ -669,6 +734,41 @@ def analyze_supplier_message_with_ollama(
 
     history_text = _format_recent_history(message_history)
 
+    if is_multi_item:
+        item_lines = "\n".join(
+            f"- {item['item_material']}: quantity {item['quantity']}"
+            for item in order_items
+        )
+        item_context_block = (
+            "This message is about an order with multiple items. Items "
+            f"this supplier was asked to quote:\n{item_lines}"
+        )
+        multi_item_instructions = (
+            "\n- This message is about a multi-item order. In addition to "
+            "the overall message_category/recommended_action (which "
+            "describe the reply as a whole - risk topics, refusals, hard "
+            "stops, etc. apply to the whole conversation, not one item), "
+            "extract a price for EACH item the message actually prices "
+            'into "item_offers". Do not invent a price for an item the '
+            "message does not mention - omit it instead. If one price "
+            'explicitly applies to several items (e.g. "all at USD 20"), '
+            "repeat that price for each item it clearly covers. Set each "
+            "entry's price_certainty to TENTATIVE if that item's price is "
+            "hedged/uncertain, else CONFIRMED."
+        )
+        item_offers_schema_line = (
+            ',\n  "item_offers": [{"item_material": "string (must match one '
+            'of the items listed above)", "unit_price_usd": number or '
+            'null, "price_certainty": "TENTATIVE | CONFIRMED"}]'
+        )
+    else:
+        item_context_block = (
+            f"Item: {case_data.get('item_material')}\n"
+            f"Requested quantity: {case_data.get('quantity')}"
+        )
+        multi_item_instructions = ""
+        item_offers_schema_line = ""
+
     prompt = f"""
 You classify one new supplier message for a jewelry purchasing negotiation.
 Interpret meaning from the new message, the stage, and the recent conversation.
@@ -676,8 +776,7 @@ Do not send a message and do not choose a winner. Return JSON only.
 
 Stage: {conversation_stage}
 Supplier state before this reply: {supplier_state or 'UNKNOWN'}
-Item: {case_data.get('item_material')}
-Requested quantity: {case_data.get('quantity')}
+{item_context_block}
 Current supplier best price USD: {supplier_best_price_usd}
 Explicit target price USD: {target_price_usd}
 Stored provisional (unconfirmed) price USD: {provisional_price_usd}
@@ -732,7 +831,7 @@ Important negotiation rules:
   number, classify it as CLEAR_PRICE_OFFER with recommended_action=SAVE_OFFER. You
   do not need to repeat the stored price yourself; leave unit_price_usd null if the
   message itself does not restate it.
-- Do not confuse quoted earlier email text with the supplier's new intent.
+- Do not confuse quoted earlier email text with the supplier's new intent.{multi_item_instructions}
 RISK CLASSIFICATION HAS PRIORITY OVER PRICE CLASSIFICATION.
 
 First determine whether the new supplier message contains any risky or
@@ -824,7 +923,7 @@ Return exactly one JSON object with these keys:
   "offer_status": "NONE | PROVISIONAL | CONFIRMED",
   "reason": "short precise explanation",
   "suggested_clarification_question": "question or null",
-  "suggested_buyer_reply": "short draft or null"
+  "suggested_buyer_reply": "short draft or null"{item_offers_schema_line}
 }}
 """
 

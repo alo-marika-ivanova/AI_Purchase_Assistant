@@ -103,6 +103,24 @@ class PurchasingRepository:
 
         return int(row["material_count"])
 
+    def list_goods_names_by_group(self, goods_group: str) -> list[str]:
+        """Return distinct goods_name values for one catalog group (e.g.
+        'Precious stones', 'Diamonds'), used to match uploaded RFQ files
+        against the real supplier catalog."""
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT sg.goods_name
+                FROM supplier_goods sg
+                JOIN suppliers s ON s.id = sg.supplier_id
+                WHERE s.active = 1 AND sg.goods_group = ?
+                ORDER BY sg.goods_name
+                """,
+                (goods_group,),
+            ).fetchall()
+
+        return [row["goods_name"] for row in rows]
+
     def list_suppliers_for_material(self, goods_name: str) -> list[dict]:
         with get_connection() as conn:
             rows = conn.execute(
@@ -340,10 +358,15 @@ class PurchasingRepository:
                 (case_id,),
             ).fetchall()
 
+        attachments = self.list_attachments_for_case(case_id)
+        items = self.list_case_items(case_id)
+
         return {
             "case": dict(case),
             "suppliers": [dict(row) for row in suppliers],
             "events": [dict(row) for row in events],
+            "attachments": attachments,
+            "items": items,
         }
 
     def update_case_status(self, case_id: int, status: str) -> None:
@@ -357,6 +380,14 @@ class PurchasingRepository:
                 (status, case_id),
             )
             conn.commit()
+
+    # Note: rfq_batches / negotiation_cases.batch_id were an earlier,
+    # superseded grouping model (one case per supplier). Now that a case
+    # created from an uploaded RFQ file already represents the whole order
+    # (see case_service.create_case_from_detected_items, case_items,
+    # case_item_suppliers), that grouping is unnecessary. The table/column
+    # are left in the schema (dropping columns is not additive) but nothing
+    # writes to them anymore.
 
     # ---------- Common validation ----------
 
@@ -494,6 +525,7 @@ class PurchasingRepository:
         extraction_confidence: str,
         notes: str | None,
         status: str = "active",
+        case_item_id: int | None = None,
     ) -> int:
         total_price_usd = None
         if quantity is not None and quantity > 0:
@@ -504,14 +536,15 @@ class PurchasingRepository:
                 """
                 INSERT INTO offers
                 (
-                    case_id, supplier_id, message_id, unit_price_usd,
-                    quantity, total_price_usd, extraction_method,
-                    extraction_confidence, status, notes
+                    case_id, case_item_id, supplier_id, message_id,
+                    unit_price_usd, quantity, total_price_usd,
+                    extraction_method, extraction_confidence, status, notes
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     case_id,
+                    case_item_id,
                     supplier_id,
                     message_id,
                     unit_price_usd,
@@ -610,6 +643,153 @@ class PurchasingRepository:
 
         return updated_count
 
+    def get_latest_provisional_offer_for_case_item_supplier(
+        self,
+        case_item_id: int,
+        supplier_id: int,
+    ) -> dict | None:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    o.id AS offer_id,
+                    o.case_id,
+                    o.case_item_id,
+                    o.supplier_id,
+                    o.message_id,
+                    o.unit_price_usd,
+                    o.extraction_method,
+                    o.extraction_confidence,
+                    o.status,
+                    o.notes,
+                    o.created_at
+                FROM offers o
+                WHERE o.case_item_id = ?
+                  AND o.supplier_id = ?
+                  AND o.status = 'provisional'
+                ORDER BY o.id DESC
+                LIMIT 1
+                """,
+                (case_item_id, supplier_id),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def supersede_provisional_offers_for_case_item_supplier(
+        self,
+        case_item_id: int,
+        supplier_id: int,
+        reason: str,
+    ) -> int:
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE offers
+                SET
+                    status = 'superseded',
+                    notes = CASE
+                        WHEN notes IS NULL OR TRIM(notes) = '' THEN ?
+                        ELSE notes || ' | ' || ?
+                    END
+                WHERE case_item_id = ?
+                  AND supplier_id = ?
+                  AND status = 'provisional'
+                """,
+                (reason, reason, case_item_id, supplier_id),
+            )
+            updated_count = int(cursor.rowcount)
+            conn.commit()
+
+        return updated_count
+
+    def get_best_offer_for_case_item_supplier(
+        self,
+        case_item_id: int,
+        supplier_id: int,
+    ) -> dict | None:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    o.id AS offer_id, o.case_id, o.case_item_id, o.supplier_id,
+                    s.name AS supplier_name, s.supplier_code,
+                    o.unit_price_usd, o.quantity, o.total_price_usd,
+                    o.extraction_method, o.extraction_confidence, o.notes,
+                    o.created_at
+                FROM offers o
+                JOIN suppliers s ON s.id = o.supplier_id
+                WHERE o.case_item_id = ?
+                  AND o.supplier_id = ?
+                  AND o.status = 'active'
+                ORDER BY o.unit_price_usd ASC, o.id DESC
+                LIMIT 1
+                """,
+                (case_item_id, supplier_id),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def list_best_offers_for_case_item(self, case_item_id: int) -> list[dict]:
+        """One best (cheapest active) offer per supplier linked to this
+        item, for comparing suppliers on a single order line."""
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    o.id AS offer_id, o.case_item_id, o.supplier_id,
+                    s.name AS supplier_name, s.supplier_code,
+                    o.unit_price_usd, o.extraction_method,
+                    o.extraction_confidence, o.created_at
+                FROM offers o
+                JOIN suppliers s ON s.id = o.supplier_id
+                WHERE o.case_item_id = ?
+                  AND o.status = 'active'
+                  AND o.id = (
+                        SELECT o2.id FROM offers o2
+                        WHERE o2.case_item_id = o.case_item_id
+                          AND o2.supplier_id = o.supplier_id
+                          AND o2.status = 'active'
+                        ORDER BY o2.unit_price_usd ASC, o2.id DESC
+                        LIMIT 1
+                  )
+                ORDER BY o.unit_price_usd ASC, o.id DESC
+                """,
+                (case_item_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def get_latest_provisional_offer_for_case_item(
+        self, case_item_id: int
+    ) -> list[dict]:
+        """All suppliers' current provisional (unconfirmed) offers for one
+        item, for display alongside confirmed ones in the item comparison."""
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    o.id AS offer_id, o.case_item_id, o.supplier_id,
+                    s.name AS supplier_name,
+                    o.unit_price_usd, o.created_at
+                FROM offers o
+                JOIN suppliers s ON s.id = o.supplier_id
+                WHERE o.case_item_id = ?
+                  AND o.status = 'provisional'
+                  AND o.id = (
+                        SELECT o2.id FROM offers o2
+                        WHERE o2.case_item_id = o.case_item_id
+                          AND o2.supplier_id = o.supplier_id
+                          AND o2.status = 'provisional'
+                        ORDER BY o2.id DESC
+                        LIMIT 1
+                  )
+                ORDER BY s.name
+                """,
+                (case_item_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
     def list_offers_for_case(self, case_id: int) -> list[dict]:
         with get_connection() as conn:
             rows = conn.execute(
@@ -671,12 +851,22 @@ class PurchasingRepository:
         return [dict(row) for row in rows]
 
     def approve_winner(self, case_id: int, offer_id: int, reason: str) -> int:
+        """Approve a winning offer.
+
+        If the offer belongs to a specific order item (case_item_id set),
+        the winner decision is scoped to that item, so different items in
+        the same order can have different winning suppliers. The case as a
+        whole only moves to WINNER SELECTED once every one of its items has
+        a winner decided (a legacy single-item case, with no case_items
+        rows at all, moves to WINNER SELECTED immediately, as before).
+        """
         with get_connection() as conn:
             offer = conn.execute(
                 """
                 SELECT
                     o.id,
                     o.case_id,
+                    o.case_item_id,
                     o.supplier_id,
                     s.name AS supplier_name,
                     o.unit_price_usd
@@ -693,26 +883,55 @@ class PurchasingRepository:
                 raise ValueError("Offer not found for this case.")
 
             offer = dict(offer)
+            case_item_id = offer.get("case_item_id")
 
             cur = conn.execute(
                 """
                 INSERT INTO winner_decisions
-                (case_id, supplier_id, offer_id, decision_status, reason, approved_by)
-                VALUES (?, ?, ?, 'approved', ?, 'buyer')
+                (case_id, case_item_id, supplier_id, offer_id, decision_status, reason, approved_by)
+                VALUES (?, ?, ?, ?, 'approved', ?, 'buyer')
                 """,
-                (case_id, offer["supplier_id"], offer_id, reason),
+                (case_id, case_item_id, offer["supplier_id"], offer_id, reason),
             )
 
             decision_id = int(cur.lastrowid)
 
-            conn.execute(
-                """
-                UPDATE negotiation_cases
-                SET status = 'WINNER SELECTED'
-                WHERE id = ?
-                """,
+            item_label = ""
+            if case_item_id is not None:
+                item_row = conn.execute(
+                    "SELECT item_material FROM case_items WHERE id = ?",
+                    (case_item_id,),
+                ).fetchone()
+                if item_row is not None:
+                    item_label = f" for {item_row['item_material']}"
+
+            total_items = conn.execute(
+                "SELECT COUNT(*) AS n FROM case_items WHERE case_id = ?",
                 (case_id,),
-            )
+            ).fetchone()["n"]
+
+            if total_items > 0:
+                decided_items = conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT case_item_id) AS n
+                    FROM winner_decisions
+                    WHERE case_id = ? AND case_item_id IS NOT NULL
+                    """,
+                    (case_id,),
+                ).fetchone()["n"]
+                all_items_decided = decided_items >= total_items
+            else:
+                all_items_decided = True
+
+            if all_items_decided:
+                conn.execute(
+                    """
+                    UPDATE negotiation_cases
+                    SET status = 'WINNER SELECTED'
+                    WHERE id = ?
+                    """,
+                    (case_id,),
+                )
 
             conn.execute(
                 """
@@ -721,7 +940,8 @@ class PurchasingRepository:
                 """,
                 (
                     case_id,
-                    f"Buyer approved {offer['supplier_name']} as winner at USD {offer['unit_price_usd']}.",
+                    f"Buyer approved {offer['supplier_name']} as winner"
+                    f"{item_label} at USD {offer['unit_price_usd']}.",
                 ),
             )
 
@@ -744,6 +964,7 @@ class PurchasingRepository:
                 SELECT
                     wd.id,
                     wd.case_id,
+                    wd.case_item_id,
                     wd.supplier_id,
                     s.supplier_code,
                     s.name AS supplier_name,
@@ -761,6 +982,65 @@ class PurchasingRepository:
                 LIMIT 1
                 """,
                 (case_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def list_winner_decisions_for_case(self, case_id: int) -> list[dict]:
+        """All winner decisions for a case. A multi-item order can have one
+        per item; a legacy single-item case has at most one."""
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    wd.id,
+                    wd.case_id,
+                    wd.case_item_id,
+                    wd.supplier_id,
+                    s.supplier_code,
+                    s.name AS supplier_name,
+                    wd.offer_id,
+                    o.unit_price_usd,
+                    wd.decision_status,
+                    wd.reason,
+                    wd.approved_by,
+                    wd.created_at
+                FROM winner_decisions wd
+                JOIN suppliers s ON s.id = wd.supplier_id
+                JOIN offers o ON o.id = wd.offer_id
+                WHERE wd.case_id = ?
+                ORDER BY wd.id DESC
+                """,
+                (case_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def get_winner_decision_for_case_item(self, case_item_id: int) -> dict | None:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    wd.id,
+                    wd.case_id,
+                    wd.case_item_id,
+                    wd.supplier_id,
+                    s.supplier_code,
+                    s.name AS supplier_name,
+                    wd.offer_id,
+                    o.unit_price_usd,
+                    wd.decision_status,
+                    wd.reason,
+                    wd.approved_by,
+                    wd.created_at
+                FROM winner_decisions wd
+                JOIN suppliers s ON s.id = wd.supplier_id
+                JOIN offers o ON o.id = wd.offer_id
+                WHERE wd.case_item_id = ?
+                ORDER BY wd.id DESC
+                LIMIT 1
+                """,
+                (case_item_id,),
             ).fetchone()
 
         return dict(row) if row else None
@@ -945,6 +1225,15 @@ class PurchasingRepository:
     def get_case_basic(self, case_id: int) -> dict | None:
         """
         Return basic case fields needed for RFQ text generation.
+
+        Does not attach case_items: a case can now hold several items
+        shared across different suppliers (see case_item_suppliers), so
+        which items are relevant depends on which supplier a message is
+        being composed for. Callers composing a supplier-facing message
+        should merge in repo.list_case_items_for_supplier(case_id,
+        supplier_id) as case_data["items"] themselves. Legacy single-item
+        cases have no case_items rows either way, so their messages are
+        unaffected.
         """
         with get_connection() as conn:
             row = conn.execute(
@@ -3564,7 +3853,105 @@ class PurchasingRepository:
 
         return dict(row) if row else None
 
+    def upsert_case_item_negotiation_context(
+        self,
+        case_item_id: int,
+        case_id: int,
+        initial_best_offer_usd: float,
+        target_price_usd: float,
+        best_supplier_id: int,
+        best_offer_id: int,
+        valid_offer_count: int,
+        target_discount_percent: float,
+        ranking_json: str,
+    ) -> None:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO case_item_negotiation_context
+                (
+                    case_item_id,
+                    case_id,
+                    initial_best_offer_usd,
+                    target_price_usd,
+                    best_supplier_id,
+                    best_offer_id,
+                    valid_offer_count,
+                    target_discount_percent,
+                    ranking_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP
+                )
+                ON CONFLICT(case_item_id)
+                DO UPDATE SET
+                    initial_best_offer_usd =
+                        excluded.initial_best_offer_usd,
+                    target_price_usd =
+                        excluded.target_price_usd,
+                    best_supplier_id =
+                        excluded.best_supplier_id,
+                    best_offer_id =
+                        excluded.best_offer_id,
+                    valid_offer_count =
+                        excluded.valid_offer_count,
+                    target_discount_percent =
+                        excluded.target_discount_percent,
+                    ranking_json =
+                        excluded.ranking_json,
+                    updated_at =
+                        CURRENT_TIMESTAMP
+                """,
+                (
+                    case_item_id,
+                    case_id,
+                    initial_best_offer_usd,
+                    target_price_usd,
+                    best_supplier_id,
+                    best_offer_id,
+                    valid_offer_count,
+                    target_discount_percent,
+                    ranking_json,
+                ),
+            )
 
+            conn.commit()
+
+    def get_case_item_negotiation_context(
+        self,
+        case_item_id: int,
+    ) -> dict | None:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    cinc.case_item_id,
+                    cinc.case_id,
+                    cinc.initial_best_offer_usd,
+                    cinc.target_price_usd,
+                    cinc.best_supplier_id,
+                    s.name AS best_supplier_name,
+                    s.supplier_code AS best_supplier_code,
+                    cinc.best_offer_id,
+                    cinc.valid_offer_count,
+                    cinc.target_discount_percent,
+                    cinc.ranking_json,
+                    cinc.created_at,
+                    cinc.updated_at
+                FROM case_item_negotiation_context cinc
+                JOIN suppliers s
+                  ON s.id = cinc.best_supplier_id
+                WHERE cinc.case_item_id = ?
+                LIMIT 1
+                """,
+                (case_item_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
 
     def acquire_action_lock(
             self,
@@ -4673,3 +5060,195 @@ class PurchasingRepository:
             ).fetchone()
 
         return dict(row) if row else None
+
+    # ---------- Attachments ----------
+
+    def add_attachment(
+        self,
+        case_id: int,
+        original_filename: str,
+        stored_path: str,
+        mime_type: str | None,
+        size_bytes: int,
+        sha256_hash: str,
+        supplier_id: int | None = None,
+        message_id: int | None = None,
+        channel: str = "manual",
+        direction: str = "outbound",
+    ) -> int:
+        with get_connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO attachments
+                (
+                    case_id,
+                    supplier_id,
+                    message_id,
+                    channel,
+                    direction,
+                    original_filename,
+                    stored_path,
+                    mime_type,
+                    size_bytes,
+                    sha256_hash
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    case_id,
+                    supplier_id,
+                    message_id,
+                    channel,
+                    direction,
+                    original_filename,
+                    stored_path,
+                    mime_type,
+                    size_bytes,
+                    sha256_hash,
+                ),
+            )
+
+            attachment_id = int(cur.lastrowid)
+
+            conn.execute(
+                """
+                INSERT INTO negotiation_events
+                (
+                    case_id,
+                    event_type,
+                    details
+                )
+                VALUES (?, 'attachment_uploaded', ?)
+                """,
+                (
+                    case_id,
+                    f"Attachment uploaded: {original_filename} ({size_bytes} bytes).",
+                ),
+            )
+
+            conn.execute(
+                """
+                INSERT INTO action_logs
+                (
+                    case_id,
+                    action,
+                    details
+                )
+                VALUES (?, 'add_attachment', ?)
+                """,
+                (
+                    case_id,
+                    f"Attachment {attachment_id} stored for case {case_id}: {original_filename}.",
+                ),
+            )
+
+            conn.commit()
+
+        return attachment_id
+
+    # ---------- Case items (subcase item breakdown) ----------
+
+    def add_case_item(
+        self,
+        case_id: int,
+        item_material: str,
+        quantity: float | None = None,
+        source_description: str | None = None,
+    ) -> int:
+        with get_connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO case_items
+                (case_id, item_material, quantity, source_description)
+                VALUES (?, ?, ?, ?)
+                """,
+                (case_id, item_material, quantity, source_description),
+            )
+            conn.commit()
+
+        return int(cur.lastrowid)
+
+    def list_case_items(self, case_id: int) -> list[dict]:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, case_id, item_material, quantity, source_description,
+                       created_at
+                FROM case_items
+                WHERE case_id = ?
+                ORDER BY id
+                """,
+                (case_id,),
+            ).fetchall()
+
+        items = [dict(row) for row in rows]
+        for item in items:
+            item["suppliers"] = self.list_suppliers_for_case_item(item["id"])
+
+        return items
+
+    def add_case_item_supplier(self, case_item_id: int, supplier_id: int) -> int:
+        with get_connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO case_item_suppliers
+                (case_item_id, supplier_id)
+                VALUES (?, ?)
+                """,
+                (case_item_id, supplier_id),
+            )
+            conn.commit()
+
+        return int(cur.lastrowid)
+
+    def list_suppliers_for_case_item(self, case_item_id: int) -> list[dict]:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.id, s.supplier_code, s.name
+                FROM case_item_suppliers cis
+                JOIN suppliers s ON s.id = cis.supplier_id
+                WHERE cis.case_item_id = ?
+                ORDER BY s.name
+                """,
+                (case_item_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def list_case_items_for_supplier(
+        self, case_id: int, supplier_id: int
+    ) -> list[dict]:
+        """Items within one order-case that a specific supplier was asked
+        to quote - used to compose that supplier's own message so it only
+        lists their relevant items, not the whole order."""
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT ci.id, ci.case_id, ci.item_material, ci.quantity,
+                       ci.source_description, ci.created_at
+                FROM case_items ci
+                JOIN case_item_suppliers cis ON cis.case_item_id = ci.id
+                WHERE ci.case_id = ? AND cis.supplier_id = ?
+                ORDER BY ci.id
+                """,
+                (case_id, supplier_id),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def list_attachments_for_case(self, case_id: int) -> list[dict]:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, case_id, supplier_id, message_id, channel, direction,
+                       original_filename, stored_path, mime_type, size_bytes,
+                       sha256_hash, created_at
+                FROM attachments
+                WHERE case_id = ?
+                ORDER BY id
+                """,
+                (case_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]

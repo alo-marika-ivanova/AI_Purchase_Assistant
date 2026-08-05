@@ -26,3 +26,10 @@ class NegotiationAction:
     target_price_usd: float | None = None
     supplier_best_price_usd: float | None = None
     reason: str = ""
+    # Per-item target/best-price breakdown for a supplier linked to more
+    # than one case_item. When set, this - not the single scalar fields
+    # above - is authoritative for message wording; the scalars are kept
+    # populated (as a representative value) for logging and action-lock
+    # keying only. Each entry: {case_item_id, item_material,
+    # best_price_usd, target_price_usd}.
+    item_targets: list[dict] | None = None
