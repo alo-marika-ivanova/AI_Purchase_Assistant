@@ -28,12 +28,21 @@ _MM_PATTERN = re.compile(r"\bmm\b", re.IGNORECASE)
 
 @dataclass(frozen=True)
 class DetectedRfqItem:
-    """One catalog item (a stone, or a brilliant size/color bucket) found in
-    an uploaded RFQ file, plus enough context for the buyer to review it."""
+    """One catalog item (a stone row, or a brilliant size/color bucket) found
+    in an uploaded RFQ file, plus enough context for the buyer to review it."""
 
     goods_name: str
     description: str
     quantity: float | None
+    item_label: str | None = None
+
+    @property
+    def display_name(self) -> str:
+        """Buyer-facing label, also used as the created subcase's
+        item_material - distinct per row for natural stones (whose catalog
+        goods_name alone doesn't capture size/shape) versus goods_name for
+        brilliants (where goods_name already is the meaningful bucket)."""
+        return self.item_label or self.goods_name
 
 
 @dataclass(frozen=True)
@@ -194,8 +203,7 @@ def _detect_natural_stone_rfq(workbook) -> RfqDetectionResult | None:
         description_col = header_cols["description"]
         quantity_col = _find_column_containing(ws, header_row_index, "quantity")
 
-        matched_quantities: dict[str, float] = {}
-        matched_descriptions: dict[str, list[str]] = {}
+        items: list[DetectedRfqItem] = []
         unresolved_lines: list[str] = []
 
         for row_index in range(header_row_index + 1, ws.max_row + 1):
@@ -213,26 +221,23 @@ def _detect_natural_stone_rfq(workbook) -> RfqDetectionResult | None:
 
             score, goods_name = _best_catalog_match(description_text, catalog)
             if goods_name is not None and score >= NATURAL_STONE_MATCH_THRESHOLD:
-                matched_quantities[goods_name] = matched_quantities.get(
-                    goods_name, 0.0
-                ) + (quantity_value or 0.0)
-                matched_descriptions.setdefault(goods_name, []).append(
-                    description_text
+                # Each row is kept as its own item, never merged with other
+                # rows matching the same catalog stone: different sizes (and
+                # shapes) of the same stone can carry a different price per
+                # carat, so each becomes its own subcase.
+                items.append(
+                    DetectedRfqItem(
+                        goods_name=goods_name,
+                        description=description_text,
+                        quantity=quantity_value or None,
+                        item_label=description_text,
+                    )
                 )
             else:
                 unresolved_lines.append(description_text)
 
-        if not matched_quantities:
+        if not items:
             continue
-
-        items = [
-            DetectedRfqItem(
-                goods_name=goods_name,
-                description="; ".join(matched_descriptions[goods_name]),
-                quantity=quantity or None,
-            )
-            for goods_name, quantity in matched_quantities.items()
-        ]
 
         return RfqDetectionResult(
             recognized=True,

@@ -125,6 +125,7 @@ def record_negotiation_supplier_message(
     supplier_id: int,
     channel: str,
     body: str,
+    analysis_text: str | None = None,
 ) -> dict:
     """
     Handle one supplier reply received after a target-price request.
@@ -136,10 +137,23 @@ def record_negotiation_supplier_message(
     - refusal to reduce;
     - promise to reply later;
     - risky, compound, or unclear replies -> human review.
+
+    ``analysis_text``, when given, is what the classifier/regex fallback
+    read instead of ``body`` - used when the buyer simulates a supplier
+    reply that arrived as an attached file: ``body`` stays a short
+    human-facing note (stored and shown in the chat) while
+    ``analysis_text`` carries the file's extracted content, so the chat
+    stays readable and the attachment's own download link is what surfaces
+    the full content, not a wall of flattened spreadsheet text.
     """
     clean_body = (body or "").strip()
 
     if not clean_body:
+        raise ValueError("Supplier message body is required.")
+
+    text_for_analysis = (analysis_text or body or "").strip()
+
+    if not text_for_analysis:
         raise ValueError("Supplier message body is required.")
 
     case_data = repo.get_case_basic(case_id)
@@ -226,7 +240,7 @@ def record_negotiation_supplier_message(
     )
 
     supplier_text = _extract_supplier_authored_text(
-        clean_body
+        text_for_analysis
     )
 
     analysis = analyze_supplier_message_with_ollama(

@@ -181,6 +181,7 @@ def fallback_message(
     supplier_best_price_usd: float | None = None,
     winning_price_usd: float | None = None,
     item_targets: list[dict] | None = None,
+    item_provisional_prices: list[dict] | None = None,
 ) -> dict:
     """Safe supplier-specific fallback used when Ollama is unavailable."""
     supplier_name = supplier.get("name", "there")
@@ -254,6 +255,20 @@ def fallback_message(
         )
         body = templates[variant]
         reason = "Supplier-specific fallback RFQ reminder."
+
+    elif intent == "acknowledge_tentative_price" and item_provisional_prices:
+        item_lines = "\n".join(
+            f"- {entry['item_material']}: USD "
+            f"{_format_usd_price(entry['unit_price_usd'])} per unit (provisional)"
+            for entry in item_provisional_prices
+        )
+        body = (
+            f"{opening} {supplier_name},\n\n"
+            "Thank you for the update. We see the following provisional "
+            f"unit price(s) - please confirm each once you have verified "
+            f"it internally:\n\n{item_lines}\n\nBest regards"
+        )
+        reason = "Fallback multi-item acknowledgment of provisional prices."
 
     elif intent == "acknowledge_tentative_price":
         if supplier_best_price_usd is None:
@@ -465,6 +480,7 @@ def write_buyer_message(
     extra_context: str = "",
     use_llm: bool | None = None,
     item_targets: list[dict] | None = None,
+    item_provisional_prices: list[dict] | None = None,
 ) -> dict:
     """
     Generate a natural buyer message.
@@ -491,6 +507,7 @@ def write_buyer_message(
             supplier_best_price_usd=supplier_best_price_usd,
             winning_price_usd=winning_price_usd,
             item_targets=item_targets,
+            item_provisional_prices=item_provisional_prices,
         )
 
     history_text = _format_recent_history(message_history or [])
@@ -534,6 +551,17 @@ def write_buyer_message(
             "- Per-item targets - ask about EACH item individually and "
             "state its own target explicitly, do not blend them into one "
             f"shared number:\n{item_targets_lines}"
+        )
+    elif item_provisional_prices:
+        item_provisional_lines = "\n".join(
+            f"- {entry['item_material']}: USD "
+            f"{entry['unit_price_usd']:.2f} per unit (provisional)"
+            for entry in item_provisional_prices
+        )
+        price_context_block = (
+            "- Per-item provisional prices - acknowledge EACH item's own "
+            "amount explicitly, do not blend them into one shared "
+            f"number:\n{item_provisional_lines}"
         )
     else:
         price_context_block = (
@@ -643,7 +671,18 @@ Return JSON only in this exact format:
                     "the explicit target price."
                 )
 
-        if intent == "acknowledge_tentative_price":
+        if intent == "acknowledge_tentative_price" and item_provisional_prices:
+            for entry in item_provisional_prices:
+                if not _message_mentions_target_price(
+                    message=message,
+                    target_price_usd=entry["unit_price_usd"],
+                ):
+                    raise ValueError(
+                        "LLM multi-item acknowledgment omitted the explicit "
+                        f"provisional price for {entry['item_material']}."
+                    )
+
+        elif intent == "acknowledge_tentative_price":
             if supplier_best_price_usd is None:
                 raise ValueError(
                     "Provisional price is required for acknowledgment wording."
@@ -689,6 +728,7 @@ Return JSON only in this exact format:
             supplier_best_price_usd=supplier_best_price_usd,
             winning_price_usd=winning_price_usd,
             item_targets=item_targets,
+            item_provisional_prices=item_provisional_prices,
         )
 
         fallback["method"] = "fallback_after_llm_provider_failed"

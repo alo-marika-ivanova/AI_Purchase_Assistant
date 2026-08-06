@@ -23,7 +23,12 @@ class ClaudeProvider:
             )
 
         self.model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
-        self.max_tokens = int(os.getenv("ANTHROPIC_MAX_TOKENS", "1024"))
+        # A multi-item order's classification response includes one
+        # item_offers entry per item on top of the usual fields; 1024 was
+        # enough for a single-item reply but silently truncated mid-JSON for
+        # a several-item order, which then fails to parse and is reported as
+        # an unclassifiable message with no price extracted at all.
+        self.max_tokens = int(os.getenv("ANTHROPIC_MAX_TOKENS", "4096"))
         self._client = Anthropic(api_key=api_key, max_retries=2)
 
     def generate(

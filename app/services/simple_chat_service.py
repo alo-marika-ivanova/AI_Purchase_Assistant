@@ -56,13 +56,57 @@ def _normalize_item_name_for_matching(text: str) -> str:
     return " ".join(text.split())
 
 
-def _item_name_match_score(target: str, candidate: str) -> float:
-    if not target or not candidate:
-        return 0.0
+def _containment_score(target: str, candidate: str) -> float:
     if target in candidate or candidate in target:
         shorter, longer = sorted((len(target), len(candidate)))
         return 1.0 - 0.3 * (1 - shorter / longer)
     return difflib.SequenceMatcher(None, target, candidate).ratio()
+
+
+# A windowed fragment must cover at least this fraction of the other side's
+# length to be scored via the lenient containment formula below - otherwise
+# a single generic shared word (e.g. "garnet") would look like a strong
+# match against a much longer, genuinely different name that merely starts
+# with it (e.g. "Garnet Hessonite" vs "Garnet pink round regular 5 mm").
+# This only guards the windowed extension; the existing whole-string
+# comparison (unwindowed) is unchanged, since that already relies on it.
+_WINDOW_MIN_LENGTH_RATIO = 0.6
+
+
+def _item_name_match_score(target: str, candidate: str) -> float:
+    """Fuzzy-match a supplier-stated item name against a case's stored
+    item_material.
+
+    A supplier filling in a price next to a pre-populated line-item
+    description often echoes the FULL description back (e.g. "peridot
+    round regular 2 mm"), while the case's own item_material can be just
+    the short catalog name ("Peridote (PER)") - itself sometimes a minor
+    spelling variant of the supplier's wording (peridot/peridote). Scoring
+    the two full strings against each other via SequenceMatcher penalizes
+    that length gap even though the core stone name is a near-exact match.
+    Trying progressively shorter leading-word windows of each side -
+    mirroring rfq_detection_service._best_catalog_match - finds that match
+    instead of just comparing the whole phrases; the existing best-vs-second
+    margin check in _resolve_case_item_id is what keeps this from
+    conflating two genuinely different items that merely share a first
+    word (e.g. "Garnet Pink" vs "Garnet Hessonite" - see
+    _WINDOW_MIN_LENGTH_RATIO above for the other half of that guard).
+    """
+    if not target or not candidate:
+        return 0.0
+
+    best_score = _containment_score(target, candidate)
+
+    for text, other in ((target, candidate), (candidate, target)):
+        tokens = text.split()
+        for window in range(min(4, len(tokens)), 0, -1):
+            windowed = " ".join(tokens[:window])
+            shorter, longer = sorted((len(windowed), len(other)))
+            if longer == 0 or shorter / longer < _WINDOW_MIN_LENGTH_RATIO:
+                continue
+            best_score = max(best_score, _containment_score(windowed, other))
+
+    return best_score
 
 
 def _resolve_case_item_id(
@@ -616,6 +660,7 @@ def send_or_display_outbound_message(
     send_email: bool = False,
     send_whatsapp: bool = False,
     send_real_message: bool | None = None,
+    attachment_ids: list[int] | None = None,
 ) -> dict:
     """Store an outbound message and deliver it according to case mode.
 
@@ -627,6 +672,15 @@ def send_or_display_outbound_message(
     real case, but they cannot turn a simulation case into a real one.
     ``send_real_message`` is retained only for backward-compatible callers and
     is intentionally not used as a mode override.
+
+    ``attachment_ids``, when given, links copies of those existing
+    case attachments to the new message *before* it is sent, so an email
+    delivery (immediate or a later automatic retry) picks them up by
+    looking them up from the message_id - see
+    transport_delivery_service.deliver_claimed_email_job. A WhatsApp-channel
+    supplier still only gets the text: the WhatsApp integration has no
+    document-sending support yet, so the file is recorded but not
+    transmitted over that channel.
     """
     clean_body = body.strip()
     if not clean_body:
@@ -675,6 +729,27 @@ def send_or_display_outbound_message(
         approved_by_buyer=True,
     )
 
+    linked_attachment_ids = []
+    for source_attachment_id in attachment_ids or []:
+        source = repo.get_attachment_by_id(int(source_attachment_id))
+        if source is None or int(source["case_id"]) != case_id:
+            continue
+
+        linked_attachment_ids.append(
+            repo.add_attachment(
+                case_id=case_id,
+                original_filename=source["original_filename"],
+                stored_path=source["stored_path"],
+                mime_type=source["mime_type"],
+                size_bytes=source["size_bytes"],
+                sha256_hash=source["sha256_hash"],
+                supplier_id=supplier_id,
+                message_id=message_id,
+                channel=channel,
+                direction="outbound",
+            )
+        )
+
     send_result = None
 
     if real_channel == "email":
@@ -688,6 +763,7 @@ def send_or_display_outbound_message(
         "send_real_message": bool(real_channel),
         "real_channel": real_channel,
         "send_result": send_result,
+        "attachment_ids": linked_attachment_ids,
     }
 
 
@@ -696,15 +772,28 @@ def record_supplier_message_simple(
     supplier_id: int,
     channel: str,
     body: str,
+    analysis_text: str | None = None,
 ) -> dict:
     """
     Save and semantically interpret one inbound supplier message.
 
     Ollama interprets the language. Deterministic application code decides
     which state transition is allowed.
+
+    ``analysis_text``, when given, is what the classifier reads instead of
+    ``body`` - used when the buyer simulates a supplier reply that arrived
+    as an attached file: ``body`` stays a short human-facing note (stored
+    and shown in the chat) while ``analysis_text`` carries the file's
+    extracted content, so the chat stays readable and the attachment's own
+    download link is what surfaces the full content, not a wall of
+    flattened spreadsheet text.
     """
     clean_body = body.strip()
     if not clean_body:
+        raise ValueError("Supplier message body is required.")
+
+    text_for_analysis = (analysis_text or body).strip()
+    if not text_for_analysis:
         raise ValueError("Supplier message body is required.")
 
     repo.ensure_supplier_linked_to_case(case_id, supplier_id)
@@ -743,6 +832,7 @@ def record_supplier_message_simple(
             supplier_id=supplier_id,
             channel=channel,
             body=clean_body,
+            analysis_text=analysis_text,
         )
 
     inbound_message_id = repo.add_message(
@@ -799,7 +889,7 @@ def record_supplier_message_simple(
         else "RFQ"
     )
 
-    supplier_text = _extract_supplier_authored_text(clean_body)
+    supplier_text = _extract_supplier_authored_text(text_for_analysis)
 
     latest_provisional_offer = (
         repo.get_latest_provisional_offer_for_case_supplier(
@@ -821,6 +911,7 @@ def record_supplier_message_simple(
             if latest_provisional_offer is not None
             else None
         ),
+        is_attachment_reply=analysis_text is not None,
     )
 
     analyzer_recommended_action = analysis.get("recommended_action")
@@ -2463,6 +2554,7 @@ def execute_rfq_rule_action(
 
     policy = load_negotiation_policy()
     provisional_price_for_message: float | None = None
+    provisional_price_items: list[dict] | None = None
 
     # ------------------------------------------------------------------
     # Execution-level anti-duplicate and anti-spam guards.
@@ -2675,19 +2767,52 @@ def execute_rfq_rule_action(
                 ),
             }
 
-        provisional_offer = (
-            repo.get_latest_provisional_offer_for_case_supplier(
+        if supplier_items:
+            # Multi-item order: acknowledge EVERY item this supplier still
+            # has a provisional price for, not just the most recently saved
+            # one (the single-offer lookup used in the legacy branch below
+            # only returns one row for the whole case).
+            provisional_offers = repo.list_provisional_offers_for_case_supplier(
                 case_id=action.case_id,
                 supplier_id=action.supplier_id,
             )
-        )
-        if provisional_offer is None:
-            return {
-                "action": action.action_type,
-                "supplier_id": action.supplier_id,
-                "skipped": True,
-                "reason": "No provisional offer is available to acknowledge.",
-            }
+            if not provisional_offers:
+                return {
+                    "action": action.action_type,
+                    "supplier_id": action.supplier_id,
+                    "skipped": True,
+                    "reason": "No provisional offer is available to acknowledge.",
+                }
+
+            provisional_price_items = [
+                {
+                    "item_material": offer["item_material"],
+                    "unit_price_usd": float(offer["unit_price_usd"]),
+                }
+                for offer in provisional_offers
+            ]
+            provisional_offer_key = "-".join(
+                str(offer["offer_id"]) for offer in provisional_offers
+            )
+        else:
+            provisional_offer = (
+                repo.get_latest_provisional_offer_for_case_supplier(
+                    case_id=action.case_id,
+                    supplier_id=action.supplier_id,
+                )
+            )
+            if provisional_offer is None:
+                return {
+                    "action": action.action_type,
+                    "supplier_id": action.supplier_id,
+                    "skipped": True,
+                    "reason": "No provisional offer is available to acknowledge.",
+                }
+
+            provisional_price_for_message = float(
+                provisional_offer["unit_price_usd"]
+            )
+            provisional_offer_key = str(provisional_offer["offer_id"])
 
         acknowledgement_count = repo.count_supplier_outbound_message_type(
             case_id=action.case_id,
@@ -2718,12 +2843,9 @@ def execute_rfq_rule_action(
                 ),
             }
 
-        provisional_price_for_message = float(
-            provisional_offer["unit_price_usd"]
-        )
         action_key = (
             f"SEND_PROVISIONAL_PRICE_ACKNOWLEDGEMENT:"
-            f"{action.supplier_id}:{provisional_offer['offer_id']}"
+            f"{action.supplier_id}:{provisional_offer_key}"
         )
 
     elif action.action_type == "SEND_CASE_ANSWER":
@@ -2848,8 +2970,22 @@ def execute_rfq_rule_action(
         supplier=supplier,
         message_history=history,
         supplier_best_price_usd=provisional_price_for_message,
+        item_provisional_prices=provisional_price_items,
         extra_context=extra_context,
     )
+
+    # The buyer's originally-uploaded case file(s) (e.g. the RFQ workbook
+    # used to auto-detect items) ride along with the first RFQ sent to each
+    # supplier. "Not yet linked to any message" is what marks a case
+    # attachment as one of these originals, as opposed to one already sent
+    # elsewhere.
+    rfq_attachment_ids = None
+    if action.action_type == "SEND_RFQ":
+        rfq_attachment_ids = [
+            int(attachment["id"])
+            for attachment in repo.list_attachments_for_case(action.case_id)
+            if attachment.get("message_id") is None
+        ]
 
     result = send_or_display_outbound_message(
         case_id=action.case_id,
@@ -2858,6 +2994,7 @@ def execute_rfq_rule_action(
         message_type=action.message_type or "manual_note",
         send_email=send_email,
         send_real_message=send_real_message,
+        attachment_ids=rfq_attachment_ids,
     )
 
     send_result = result.get("send_result")

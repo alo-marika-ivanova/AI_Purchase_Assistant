@@ -96,6 +96,84 @@ def test_multi_item_subcase_rfq_asks_for_a_price_for_each_item() -> None:
     assert "unit price" in result["message"].lower()
 
 
+def test_multi_item_provisional_acknowledgement_lists_every_item_price() -> None:
+    """Reproduces a real bug: a supplier attachment quoting 4 different
+    subcase prices only surfaced ONE of them in the acknowledgement message
+    (the case+supplier-level lookup only kept the most recently saved
+    offer). Passing item_provisional_prices must mention every item's own
+    price, not just one shared number."""
+    case_data = {
+        "case_number": "ORD-2026-08-06-01",
+        "item_material": "RFQ order (2 items): Garnet Pink, Peridote (PER).",
+        "quantity": 152.0,
+        "notes": None,
+        "items": [
+            {"item_material": "Garnet Pink", "quantity": 12.0},
+            {"item_material": "Peridote (PER)", "quantity": 100.0},
+        ],
+    }
+
+    result = write_buyer_message(
+        intent="acknowledge_tentative_price",
+        case_data=case_data,
+        supplier=SUPPLIER,
+        item_provisional_prices=[
+            {"item_material": "Garnet Pink", "unit_price_usd": 44.0},
+            {"item_material": "Peridote (PER)", "unit_price_usd": 20.0},
+        ],
+        use_llm=False,
+    )
+
+    assert result["success"] is True
+    message = result["message"]
+    assert "44.0" in message or "44" in message
+    assert "20.0" in message or "20" in message
+    assert "Garnet Pink" in message
+    assert "Peridote (PER)" in message
+    # A single combined acknowledgement, not one message per item.
+    assert message.count("Best regards") == 1
+
+
+def test_llm_multi_item_provisional_acknowledgement_is_rejected_if_incomplete(
+    monkeypatch,
+) -> None:
+    """If the LLM's generated wording drops one item's provisional price,
+    the safeguard must reject it and fall back to the deterministic
+    template rather than silently sending an incomplete acknowledgement."""
+    fake_provider = _FakeProvider()
+    monkeypatch.setattr(
+        communication_writer, "get_llm_provider", lambda: fake_provider
+    )
+
+    case_data = {
+        "case_number": "ORD-2026-08-06-01",
+        "item_material": "RFQ order (2 items): Garnet Pink, Peridote (PER).",
+        "quantity": 152.0,
+        "notes": None,
+        "items": [
+            {"item_material": "Garnet Pink", "quantity": 12.0},
+            {"item_material": "Peridote (PER)", "quantity": 100.0},
+        ],
+    }
+
+    result = write_buyer_message(
+        intent="acknowledge_tentative_price",
+        case_data=case_data,
+        supplier=SUPPLIER,
+        item_provisional_prices=[
+            {"item_material": "Garnet Pink", "unit_price_usd": 44.0},
+            {"item_material": "Peridote (PER)", "unit_price_usd": 20.0},
+        ],
+        use_llm=True,
+    )
+
+    # _FakeProvider's canned message only mentions neither price, so the
+    # per-item safeguard should reject it and use the fallback template.
+    assert result["method"] == "fallback_after_llm_provider_failed"
+    assert "44.0" in result["message"] or "44" in result["message"]
+    assert "20.0" in result["message"] or "20" in result["message"]
+
+
 def test_llm_prompt_does_not_leak_other_items_when_scoped(monkeypatch) -> None:
     """Regression test for a real bug: the case-level item_material/quantity
     describe the WHOLE multi-supplier order. When a supplier is only linked

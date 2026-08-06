@@ -60,20 +60,46 @@ def test_natural_stone_rfq_is_recognized_and_matched(
     assert detected_names == set(NATURAL_STONE_GOODS_NAMES)
 
 
-def test_natural_stone_rfq_sums_quantity_across_matching_rows(
+def test_natural_stone_rfq_keeps_each_row_as_its_own_item(
     supplier_ids: dict[str, int],
 ) -> None:
+    """Rows matching the same catalog stone are never merged: different
+    sizes/shapes of the same stone can carry a different price per carat,
+    so each source row becomes its own item (and later its own subcase)."""
     _seed_supplier_goods(
         supplier_ids["email"], "Precious stones", NATURAL_STONE_GOODS_NAMES
     )
 
     result = detect_rfq_selection(_read_fixture("prirodni.xlsx"), "prirodni.xlsx")
 
-    by_name = {item.goods_name: item for item in result.items}
-    # Amethyst afrikan round(16) + cushion(16) + octagon(12) + oval(16) = 60
-    assert by_name["Amethyst African (AMA)"].quantity == 60.0
-    # Peridot 2mm(100) + 4mm(24) + 5mm(16) = 140
-    assert by_name["Peridote (PER)"].quantity == 140.0
+    amethyst_items = [
+        item for item in result.items if item.goods_name == "Amethyst African (AMA)"
+    ]
+    assert sorted(item.quantity for item in amethyst_items) == [12.0, 16.0, 16.0, 16.0]
+    assert {item.description for item in amethyst_items} == {
+        "Amethyst afrikan round regular 7 mm",
+        "Amethyst afrikan cushion regular 6 mm",
+        "Amethyst African octagon regular 9x7 mm",
+        "Amethyst African oval regular 5x4 mm",
+    }
+
+    peridote_items = [
+        item for item in result.items if item.goods_name == "Peridote (PER)"
+    ]
+    assert sorted(item.quantity for item in peridote_items) == [16.0, 24.0, 100.0]
+    assert {item.description for item in peridote_items} == {
+        "Peridot round regular 2 mm",
+        "Peridot round regular 4 mm",
+        "Peridot round regular 5 mm",
+    }
+
+    # Each item's display_name (used as the subcase's item_material) carries
+    # the distinguishing per-row text, not just the shared catalog name.
+    assert {item.display_name for item in peridote_items} == {
+        "Peridot round regular 2 mm",
+        "Peridot round regular 4 mm",
+        "Peridot round regular 5 mm",
+    }
 
 
 def test_natural_stone_rfq_reports_unresolved_lines_for_unmatched_stones(

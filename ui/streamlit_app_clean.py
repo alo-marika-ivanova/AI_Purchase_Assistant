@@ -18,8 +18,10 @@ from app.services.case_service import (
     list_cases,
 )
 from app.services.attachment_service import (
+    extract_text_from_spreadsheet,
     list_case_attachments,
     save_case_attachment,
+    send_case_attachment,
 )
 from app.services.rfq_detection_service import (
     RfqDetectionResult,
@@ -196,13 +198,13 @@ def _render_detected_rfq_case_creation(
         pending_items = []
 
         for index, item in enumerate(detection.items):
-            st.markdown(f"### {item.goods_name}")
+            st.markdown(f"### {item.display_name}")
             st.caption(f"From file: {item.description}")
 
             item_suppliers = list_suppliers_for_material(item.goods_name)
             if not item_suppliers:
                 st.warning(
-                    f"No active suppliers are linked to {item.goods_name}; "
+                    f"No active suppliers are linked to {item.display_name}; "
                     "this item will be skipped."
                 )
                 continue
@@ -217,7 +219,7 @@ def _render_detected_rfq_case_creation(
             }
 
             item_quantity = st.number_input(
-                f"Quantity — {item.goods_name}",
+                f"Quantity — {item.display_name}",
                 min_value=0.01,
                 value=float(item.quantity) if item.quantity else 1.0,
                 step=1.0,
@@ -225,7 +227,7 @@ def _render_detected_rfq_case_creation(
             )
 
             selected_item_supplier_labels = st.multiselect(
-                f"Suppliers — {item.goods_name}",
+                f"Suppliers — {item.display_name}",
                 options=list(item_supplier_labels.keys()),
                 default=list(item_supplier_labels.keys()),
                 key=f"rfq_item_suppliers_{index}",
@@ -233,7 +235,7 @@ def _render_detected_rfq_case_creation(
 
             pending_items.append(
                 {
-                    "item_material": item.goods_name,
+                    "item_material": item.display_name,
                     "quantity": item_quantity,
                     "supplier_ids": [
                         item_supplier_labels[label]
@@ -931,21 +933,98 @@ with main_col:
 
     case_attachments = list_case_attachments(selected_case_id)
 
-    if case_attachments:
-        with st.expander(
-            f"Attachments ({len(case_attachments)})",
-            expanded=False,
+    attachment_supplier_labels = {
+        f"{s['name']} | {s['supplier_code']}": s for s in case_suppliers
+    }
+
+    with st.expander(
+        f"Attachments ({len(case_attachments)})",
+        expanded=False,
+    ):
+        if not case_attachments:
+            st.caption("No attachments for this case yet.")
+
+        for attachment in case_attachments:
+            size_kb = attachment["size_bytes"] / 1024
+            st.markdown(
+                f"**{attachment['original_filename']}** "
+                f"— {size_kb:.1f} KB — "
+                f"{attachment['channel']}/{attachment['direction']} — "
+                f"uploaded {attachment['created_at']}"
+            )
+
+            link_col, target_col, send_col = st.columns([2, 3, 2])
+
+            with link_col:
+                try:
+                    attachment_bytes = Path(attachment["stored_path"]).read_bytes()
+                except OSError:
+                    attachment_bytes = None
+
+                if attachment_bytes is not None:
+                    st.download_button(
+                        "Open / download",
+                        data=attachment_bytes,
+                        file_name=attachment["original_filename"],
+                        mime=attachment.get("mime_type") or "application/octet-stream",
+                        key=f"download_case_attachment_{attachment['id']}",
+                    )
+                else:
+                    st.caption("File missing on disk.")
+
+            if attachment_supplier_labels:
+                with target_col:
+                    send_target_label = st.selectbox(
+                        "Send to",
+                        options=list(attachment_supplier_labels.keys()),
+                        key=f"attachment_send_target_{attachment['id']}",
+                        label_visibility="collapsed",
+                    )
+
+                with send_col:
+                    if st.button(
+                        "Send",
+                        key=f"send_case_attachment_{attachment['id']}",
+                    ):
+                        try:
+                            target_supplier = attachment_supplier_labels[
+                                send_target_label
+                            ]
+                            send_case_attachment(
+                                case_id=selected_case_id,
+                                supplier_id=int(target_supplier["id"]),
+                                attachment_id=int(attachment["id"]),
+                            )
+                            st.success(
+                                f"Sent {attachment['original_filename']} to "
+                                f"{target_supplier['name']}."
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+
+            st.markdown("---")
+
+        new_case_attachment_files = st.file_uploader(
+            "Upload a new attachment for this case",
+            accept_multiple_files=True,
+            key=f"new_case_attachment_{selected_case_id}",
+        )
+
+        if new_case_attachment_files and st.button(
+            "Save uploaded file(s) to this case",
+            key=f"save_new_case_attachment_{selected_case_id}",
         ):
-            for attachment in case_attachments:
-                size_kb = attachment["size_bytes"] / 1024
-                st.markdown(
-                    f"**{attachment['original_filename']}** "
-                    f"— {size_kb:.1f} KB — "
-                    f"{attachment['channel']}/{attachment['direction']} — "
-                    f"uploaded {attachment['created_at']}"
+            attachment_errors = _attach_uploaded_files_to_cases(
+                new_case_attachment_files, [selected_case_id]
+            )
+            if attachment_errors:
+                st.error("; ".join(attachment_errors))
+            else:
+                st.success(
+                    f"Saved {len(new_case_attachment_files)} file(s) to this case."
                 )
-    else:
-        st.caption("No attachments for this case yet.")
+            st.rerun()
 
     open_review_items = repo.list_open_human_review_items_for_case(selected_case_id)
 
@@ -1188,6 +1267,31 @@ with main_col:
 
                     st.markdown(msg["body"])
 
+                    for attachment in repo.list_attachments_for_message(
+                        int(msg["id"])
+                    ):
+                        try:
+                            attachment_bytes = Path(
+                                attachment["stored_path"]
+                            ).read_bytes()
+                        except OSError:
+                            st.caption(
+                                f"📎 {attachment['original_filename']} "
+                                "(file missing on disk)"
+                            )
+                            continue
+
+                        st.download_button(
+                            f"📎 {attachment['original_filename']}",
+                            data=attachment_bytes,
+                            file_name=attachment["original_filename"],
+                            mime=(
+                                attachment.get("mime_type")
+                                or "application/octet-stream"
+                            ),
+                            key=f"download_message_attachment_{attachment['id']}",
+                        )
+
         show_manual_buyer_message = st.checkbox(
             "Write manual buyer message",
             value=False,
@@ -1262,14 +1366,57 @@ with main_col:
             key=f"supplier_response_body_{selected_case_id}_{supplier_id}",
         )
 
+        supplier_reply_file = st.file_uploader(
+            "Or upload the supplier's price file instead (CSV/XLSX)",
+            type=["csv", "xlsx", "xlsm"],
+            key=f"supplier_reply_file_{selected_case_id}_{supplier_id}",
+            help=(
+                "Simulates a supplier reply that came as a filled-in price "
+                "file rather than typed text. Its contents are read as text "
+                "and interpreted the same way as a typed reply."
+            ),
+        )
+
         if st.button("Record supplier response and continue negotiation"):
             try:
+                display_body = supplier_body.strip()
+                analysis_text = None
+
+                if supplier_reply_file is not None:
+                    extracted_text = extract_text_from_spreadsheet(
+                        supplier_reply_file.getvalue(),
+                        supplier_reply_file.name,
+                    )
+                    analysis_text = (
+                        f"{display_body}\n\n{extracted_text}"
+                        if display_body
+                        else extracted_text
+                    )
+                    if not display_body:
+                        display_body = (
+                            "(Replied with an attached file: "
+                            f"{supplier_reply_file.name})"
+                        )
+
                 result = record_supplier_message_simple(
                     case_id=selected_case_id,
                     supplier_id=supplier_id,
                     channel="manual",
-                    body=supplier_body,
+                    body=display_body,
+                    analysis_text=analysis_text,
                 )
+
+                if supplier_reply_file is not None:
+                    save_case_attachment(
+                        case_id=selected_case_id,
+                        original_filename=supplier_reply_file.name,
+                        file_bytes=supplier_reply_file.getvalue(),
+                        supplier_id=supplier_id,
+                        message_id=result["inbound_message_id"],
+                        channel="manual",
+                        direction="inbound",
+                    )
+
                 negotiation_result = continue_negotiation_for_case(
                     case_id=selected_case_id,
                 )

@@ -616,6 +616,41 @@ class PurchasingRepository:
 
         return dict(row) if row else None
 
+    def list_provisional_offers_for_case_supplier(
+        self,
+        case_id: int,
+        supplier_id: int,
+    ) -> list[dict]:
+        """One row per case_item currently holding a provisional
+        (unconfirmed) offer from this supplier - lets a multi-item order's
+        acknowledgement message mention every pending item, not just the
+        most recently saved one."""
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    o.id AS offer_id, o.case_id, o.case_item_id, o.supplier_id,
+                    ci.item_material, o.unit_price_usd, o.created_at
+                FROM offers o
+                JOIN case_items ci ON ci.id = o.case_item_id
+                WHERE o.case_id = ?
+                  AND o.supplier_id = ?
+                  AND o.status = 'provisional'
+                  AND o.id = (
+                        SELECT o2.id FROM offers o2
+                        WHERE o2.case_item_id = o.case_item_id
+                          AND o2.supplier_id = o.supplier_id
+                          AND o2.status = 'provisional'
+                        ORDER BY o2.id DESC
+                        LIMIT 1
+                  )
+                ORDER BY ci.id
+                """,
+                (case_id, supplier_id),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
     def supersede_provisional_offers_for_case_supplier(
         self,
         case_id: int,
@@ -5249,6 +5284,37 @@ class PurchasingRepository:
                 ORDER BY id
                 """,
                 (case_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def get_attachment_by_id(self, attachment_id: int) -> dict | None:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, case_id, supplier_id, message_id, channel, direction,
+                       original_filename, stored_path, mime_type, size_bytes,
+                       sha256_hash, created_at
+                FROM attachments
+                WHERE id = ?
+                """,
+                (attachment_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def list_attachments_for_message(self, message_id: int) -> list[dict]:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, case_id, supplier_id, message_id, channel, direction,
+                       original_filename, stored_path, mime_type, size_bytes,
+                       sha256_hash, created_at
+                FROM attachments
+                WHERE message_id = ?
+                ORDER BY id
+                """,
+                (message_id,),
             ).fetchall()
 
         return [dict(row) for row in rows]

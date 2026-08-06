@@ -457,4 +457,252 @@ def test_single_item_case_data_never_triggers_multi_item_extraction(
     # (which never sets "item_offers" at all) or reach the mocked LLM (which
     # sets it to None) - either way, no item-level extraction should occur.
     assert result.get("item_offers") is None
-    assert result["unit_price_usd"] == pytest.approx(42.0)
+
+
+ATTACHMENT_ORDER_CASE_DATA = {
+    "case_number": "RFQ-2026-08-06-01",
+    "item_material": "RFQ order (2 items): Garnet Pink, Peridote (PER).",
+    "quantity": 152.0,
+    "notes": None,
+    "items": [
+        {"item_material": "Garnet pink round regular 5 mm", "quantity": 12.0},
+        {"item_material": "Peridot round regular 2 mm", "quantity": 100.0},
+    ],
+}
+
+CLEAN_MULTI_ITEM_ATTACHMENT_TEXT = (
+    "QUALITY REQUIREMENTS: TOP quality. Perfect cut, polish, symmetry.\n"
+    "ALO ID | Description | Needed quantity, pcs | Eleonora IMPORTANT notes | Price USD/ct\n"
+    "PKGRPI500 | Garnet pink round regular 5 mm | 12 | 3 sets (each set by 4 stones) | 44\n"
+    "PKPE200 | Peridot round regular 2 mm | 100 | matching | 20"
+)
+
+
+def test_attachment_derived_multi_item_reply_is_confirmed_deterministically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces a real bug: a supplier's filled-in RFQ spreadsheet, with
+    no hedging language at all, was sent to the LLM and came back
+    TENTATIVE_PRICE. is_attachment_reply=True must intercept a clean,
+    unhedged multi-item table BEFORE the LLM is called at all - the fake
+    provider below is configured to return TENTATIVE precisely to prove the
+    deterministic shortcut wins regardless of what the LLM would say."""
+    _patch_provider(
+        monkeypatch,
+        {
+            "message_category": "TENTATIVE_PRICE",
+            "recommended_action": "SAVE_PROVISIONAL_OFFER_AND_WAIT",
+            "confidence": "medium",
+            "unit_price_usd": None,
+            "currency": "USD",
+            "price_basis": "MULTIPLE",
+            "is_price_clear": True,
+            "is_currency_clear": True,
+            "has_multiple_prices": True,
+            "is_conditional": False,
+            "requires_human_review": False,
+            "contains_risky_topic": False,
+            "risk_category": "NONE",
+            "reason": "This is what the LLM would have said - must not be used.",
+            "item_offers": [
+                {
+                    "item_material": "Garnet pink round regular 5 mm",
+                    "unit_price_usd": 44,
+                    "price_certainty": "TENTATIVE",
+                },
+                {
+                    "item_material": "Peridot round regular 2 mm",
+                    "unit_price_usd": 20,
+                    "price_certainty": "TENTATIVE",
+                },
+            ],
+        },
+    )
+
+    result = analyze_supplier_message_with_ollama(
+        message_body=CLEAN_MULTI_ITEM_ATTACHMENT_TEXT,
+        case_data=ATTACHMENT_ORDER_CASE_DATA,
+        supplier={"name": "HC Arnoldi"},
+        message_history=[],
+        conversation_stage="RFQ",
+        supplier_state="AWAITING_RESPONSE",
+        is_attachment_reply=True,
+    )
+
+    assert result["provider"] == "deterministic"
+    assert result["message_category"] == "CLEAR_PRICE_OFFER"
+    assert result["recommended_action"] == "SAVE_OFFER"
+    item_offers = result["item_offers"]
+    by_material = {entry["item_material"]: entry for entry in item_offers}
+    assert by_material["Garnet pink round regular 5 mm"]["unit_price_usd"] == pytest.approx(44.0)
+    assert by_material["Peridot round regular 2 mm"]["unit_price_usd"] == pytest.approx(20.0)
+    assert all(entry["price_certainty"] == "CONFIRMED" for entry in item_offers)
+
+
+def test_same_text_typed_instead_of_attached_still_reaches_the_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deterministic multi-item shortcut is attachment-only by design -
+    a supplier typing the same table as free text must still go through the
+    LLM, per is_attachment_reply defaulting to False."""
+    _patch_provider(
+        monkeypatch,
+        {
+            "message_category": "TENTATIVE_PRICE",
+            "recommended_action": "SAVE_PROVISIONAL_OFFER_AND_WAIT",
+            "confidence": "medium",
+            "unit_price_usd": None,
+            "currency": "USD",
+            "price_basis": "MULTIPLE",
+            "is_price_clear": True,
+            "is_currency_clear": True,
+            "has_multiple_prices": True,
+            "is_conditional": False,
+            "requires_human_review": False,
+            "contains_risky_topic": False,
+            "risk_category": "NONE",
+            "reason": "The LLM was actually called for this typed reply.",
+            "item_offers": [],
+        },
+    )
+
+    result = analyze_supplier_message_with_ollama(
+        message_body=CLEAN_MULTI_ITEM_ATTACHMENT_TEXT,
+        case_data=ATTACHMENT_ORDER_CASE_DATA,
+        supplier={"name": "HC Arnoldi"},
+        message_history=[],
+        conversation_stage="RFQ",
+        supplier_state="AWAITING_RESPONSE",
+        is_attachment_reply=False,
+    )
+
+    assert result["message_category"] == "TENTATIVE_PRICE"
+    assert result["reason"] == "The LLM was actually called for this typed reply."
+
+
+class _FlakyThenGoodProvider:
+    """Returns malformed output the first N-1 calls, then a valid JSON
+    response - simulates a provider that occasionally truncates/garbles a
+    response even at temperature=0."""
+
+    name = "fake"
+    model = "fake-model"
+
+    def __init__(self, response: dict, bad_calls: int) -> None:
+        self._response = response
+        self._bad_calls = bad_calls
+        self.call_count = 0
+
+    def generate(self, prompt, *, timeout_seconds, temperature=None) -> str:
+        self.call_count += 1
+        if self.call_count <= self._bad_calls:
+            # Truncated mid-object, exactly like a real cut-off response.
+            return '{"message_category": "CLEAR_PRICE_OFFER", "unit_pri'
+        return json.dumps(self._response)
+
+
+def test_malformed_response_is_retried_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One malformed/truncated response must not immediately doom the
+    reply to human review - a retry with the same prompt gets a second
+    chance to produce valid JSON."""
+    flaky_provider = _FlakyThenGoodProvider(
+        {
+            "message_category": "CLEAR_PRICE_OFFER",
+            "recommended_action": "SAVE_OFFER",
+            "confidence": "high",
+            "unit_price_usd": 22,
+            "currency": "USD",
+            "price_basis": "UNIT",
+            "is_price_clear": True,
+            "is_currency_clear": True,
+            "has_multiple_prices": False,
+            "is_conditional": False,
+            "requires_human_review": False,
+            "contains_risky_topic": False,
+            "risk_category": "NONE",
+            "reason": "Single clear USD unit price.",
+        },
+        bad_calls=1,
+    )
+    monkeypatch.setattr(
+        classifier_module, "get_llm_provider", lambda: flaky_provider
+    )
+
+    result = analyze_supplier_message_with_ollama(
+        message_body=(
+            "Hi, mate, you are lucky, we just got new items. "
+            "The price for one unit is 22 usd."
+        ),
+        case_data=CASE_DATA,
+        supplier={"name": "New Goi Gems SRL"},
+        message_history=[],
+        conversation_stage="RFQ",
+        supplier_state="AWAITING_RESPONSE",
+    )
+
+    assert flaky_provider.call_count == 2
+    assert result["success"] is True
+    assert result["message_category"] == "CLEAR_PRICE_OFFER"
+    assert result["unit_price_usd"] == pytest.approx(22.0)
+    assert result["requires_human_review"] is False
+
+
+def test_repeatedly_malformed_response_still_fails_after_retry_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If every attempt returns malformed output, the classifier must still
+    give up (and not retry forever) and report the same kind of failure
+    result as before this safeguard existed."""
+    flaky_provider = _FlakyThenGoodProvider(
+        {"message_category": "CLEAR_PRICE_OFFER"},
+        bad_calls=99,
+    )
+    monkeypatch.setattr(
+        classifier_module, "get_llm_provider", lambda: flaky_provider
+    )
+
+    result = analyze_supplier_message_with_ollama(
+        message_body=(
+            "Hi, mate, you are lucky, we just got new items. "
+            "The price for one unit is 22 usd."
+        ),
+        case_data=CASE_DATA,
+        supplier={"name": "New Goi Gems SRL"},
+        message_history=[],
+        conversation_stage="RFQ",
+        supplier_state="AWAITING_RESPONSE",
+    )
+
+    assert flaky_provider.call_count == classifier_module.JSON_PARSE_MAX_ATTEMPTS
+    assert result["success"] is False
+    assert result["requires_human_review"] is True
+
+
+def test_auth_failure_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A provider construction failure (e.g. missing API key) fails the
+    same way every time - it must not be retried, only a malformed-JSON
+    response should be."""
+
+    def _raise_auth_error():
+        raise RuntimeError("ANTHROPIC_API_KEY is not set.")
+
+    monkeypatch.setattr(
+        classifier_module, "get_llm_provider", _raise_auth_error
+    )
+
+    result = analyze_supplier_message_with_ollama(
+        message_body=(
+            "Hi, mate, you are lucky, we just got new items. "
+            "The price for one unit is 22 usd."
+        ),
+        case_data=CASE_DATA,
+        supplier={"name": "New Goi Gems SRL"},
+        message_history=[],
+        conversation_stage="RFQ",
+        supplier_state="AWAITING_RESPONSE",
+    )
+
+    assert result["success"] is False
+    assert result["requires_human_review"] is True

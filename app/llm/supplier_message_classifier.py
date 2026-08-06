@@ -17,6 +17,10 @@ from app.llm.rfq_tentative_price_safeguard import (
     extract_tentative_rfq_unit_price,
     is_contextual_provisional_price_confirmation,
 )
+from app.llm.rfq_multi_item_price_safeguard import (
+    build_deterministic_multi_item_rfq_offer_result,
+    extract_safe_multi_item_rfq_prices,
+)
 from app.llm.negotiation_refusal_safeguard import (
     build_deterministic_refusal_result,
     classify_refusal_strength_by_regex,
@@ -29,6 +33,13 @@ load_dotenv()
 
 CLASSIFIER_TIMEOUT_SECONDS = int(
     os.getenv("LLM_CLASSIFIER_TIMEOUT_SECONDS", "60")
+)
+# A provider occasionally returns a malformed/truncated response even at
+# temperature=0 - a fresh attempt with the same prompt is often enough to
+# get a clean one, so a single retry is worth it before this reply is
+# treated as unclassifiable and sent to human review for no real reason.
+JSON_PARSE_MAX_ATTEMPTS = int(
+    os.getenv("LLM_CLASSIFIER_JSON_PARSE_MAX_ATTEMPTS", "2")
 )
 DEFAULT_NEGOTIATION_CURRENCY = os.getenv(
     "DEFAULT_NEGOTIATION_CURRENCY",
@@ -685,6 +696,7 @@ def analyze_supplier_message_with_ollama(
     target_price_usd: float | None = None,
     supplier_best_price_usd: float | None = None,
     provisional_price_usd: float | None = None,
+    is_attachment_reply: bool = False,
 ) -> dict:
     clean_body = (message_body or "").strip()
     if not clean_body:
@@ -697,6 +709,24 @@ def analyze_supplier_message_with_ollama(
 
     order_items = case_data.get("items")
     is_multi_item = isinstance(order_items, list) and len(order_items) > 1
+    is_rfq_stage = (conversation_stage or "").strip().upper() == "RFQ"
+
+    # A multi-item reply derived from an attachment (the supplier filled in
+    # prices on the RFQ's own spreadsheet template) is a highly structured,
+    # low-ambiguity shape: try to price every item deterministically before
+    # spending an LLM call on it. Free-typed multi-item text is NOT eligible
+    # here - it is unstructured and stays on the LLM path below, same as
+    # before. Bails (returns None) on any risk/hedge keyword, missing item,
+    # or unparseable price, falling through to the LLM for the whole message.
+    if is_rfq_stage and is_multi_item and is_attachment_reply:
+        deterministic_item_offers = extract_safe_multi_item_rfq_prices(
+            message_body=clean_body,
+            supplier_items=order_items,
+        )
+        if deterministic_item_offers is not None:
+            return build_deterministic_multi_item_rfq_offer_result(
+                deterministic_item_offers
+            )
 
     # The deterministic regex safeguards below are single-price-only by
     # construction (they bail if more than one number appears in the
@@ -704,7 +734,7 @@ def analyze_supplier_message_with_ollama(
     # prices in one reply, so those safeguards would either misfire or
     # reject a perfectly normal message - skip straight to the LLM, which
     # is equipped to extract a price per item.
-    if (conversation_stage or "").strip().upper() == "RFQ" and not is_multi_item:
+    if is_rfq_stage and not is_multi_item:
         if (
             provisional_price_usd is not None
             and provisional_price_usd > 0
@@ -930,12 +960,29 @@ Return exactly one JSON object with these keys:
     provider = None
     try:
         provider = get_llm_provider()
-        raw_text = provider.generate(
-            prompt,
-            timeout_seconds=CLASSIFIER_TIMEOUT_SECONDS,
-            temperature=0.0,
-        )
-        parsed = extract_json_object(raw_text)
+
+        # A malformed/truncated response is retried on a fresh call to the
+        # same prompt; anything else (auth, network, provider config) is
+        # not - those fail the same way every time, so retrying would only
+        # add latency without a chance of succeeding.
+        parsed = None
+        parse_error: ValueError | None = None
+        for attempt in range(JSON_PARSE_MAX_ATTEMPTS):
+            raw_text = provider.generate(
+                prompt,
+                timeout_seconds=CLASSIFIER_TIMEOUT_SECONDS,
+                temperature=0.0,
+            )
+            try:
+                parsed = extract_json_object(raw_text)
+                parse_error = None
+                break
+            except ValueError as exc:
+                parse_error = exc
+
+        if parsed is None:
+            raise parse_error
+
         result = _normalize_result(
             parsed=parsed,
             conversation_stage=conversation_stage,
