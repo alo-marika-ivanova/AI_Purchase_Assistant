@@ -348,6 +348,24 @@ def fallback_message(
         )
         reason = "Supplier-specific fallback target request."
 
+    elif intent == "acknowledge_refusal_and_recheck_target" and item_targets:
+        item_lines = "\n".join(
+            f"- {entry['item_material']}: still hoping for USD "
+            f"{_format_usd_price(entry['target_price_usd'])} per unit"
+            for entry in item_targets
+        )
+        body = (
+            f"{opening} {supplier_name},\n\n"
+            "Thank you for getting back to us. We understand the "
+            "following are difficult on your side - would you be able to "
+            f"check once more, internally, whether these could still be "
+            f"possible?\n\n{item_lines}\n\nBest regards"
+        )
+        reason = (
+            "Fallback multi-item acknowledgment of refusal with a "
+            "recheck request."
+        )
+
     elif intent == "acknowledge_refusal_and_recheck_target":
         if target_price_usd is None:
             raise ValueError(
@@ -364,6 +382,24 @@ def fallback_message(
         )
         reason = "Fallback acknowledgment of refusal with a recheck request."
 
+    elif intent == "express_interest_request_improvement" and item_targets:
+        item_lines = "\n".join(
+            f"- {entry['item_material']}: hoping to move closer to USD "
+            f"{_format_usd_price(entry['target_price_usd'])} per unit"
+            for entry in item_targets
+        )
+        body = (
+            f"{opening} {supplier_name},\n\n"
+            "We are genuinely interested in working with you. Is there "
+            "any way to move a bit closer on the following - even a small "
+            f"further improvement would help us move forward:\n\n"
+            f"{item_lines}\n\nBest regards"
+        )
+        reason = (
+            "Fallback multi-item expression of interest with an "
+            "improvement request."
+        )
+
     elif intent == "express_interest_request_improvement":
         if target_price_usd is None:
             raise ValueError(
@@ -379,6 +415,20 @@ def fallback_message(
             "move forward.\n\nBest regards"
         )
         reason = "Fallback expression of interest with an improvement request."
+
+    elif intent == "ask_absolute_best_price" and item_targets:
+        item_lines = "\n".join(
+            f"- {entry['item_material']}"
+            for entry in item_targets
+        )
+        body = (
+            f"{opening} {supplier_name},\n\n"
+            "Before we finalize our comparison, could you let us know "
+            "your absolute best final unit price in USD for each of the "
+            f"following? This will be the last opportunity to adjust "
+            f"them:\n\n{item_lines}\n\nBest regards"
+        )
+        reason = "Fallback multi-item final best-price request."
 
     elif intent == "ask_absolute_best_price":
         body = (

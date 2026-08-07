@@ -215,3 +215,73 @@ def test_llm_prompt_does_not_leak_other_items_when_scoped(monkeypatch) -> None:
     assert "Ruby (RBN)" not in prompt
     assert "RFQ order (3 items)" not in prompt
     assert "66.0" not in prompt
+
+
+MULTI_ITEM_TARGETS = [
+    {
+        "item_material": "Tanzanite (TAN)",
+        "best_price_usd": 40.0,
+        "target_price_usd": 36.0,
+    },
+    {
+        "item_material": "Ruby (RBN)",
+        "best_price_usd": 70.0,
+        "target_price_usd": 63.0,
+    },
+]
+
+
+def test_round_2_fallback_lists_every_pending_item_own_target() -> None:
+    """Reproduces a real gap: rounds 2-4 (acknowledge_refusal_and_recheck_target,
+    express_interest_request_improvement, ask_absolute_best_price) only had
+    single-item fallback wording, even for a multi-item order - the
+    per-item targets were computed correctly but never reached the
+    message. Each of the three intents must list every still-pending
+    item's own target once item_targets is given."""
+    case_data = {
+        "case_number": "ORD-2026-08-08-01",
+        "item_material": "RFQ order (2 items): Tanzanite (TAN), Ruby (RBN)",
+        "quantity": 50.0,
+        "notes": None,
+    }
+
+    for intent in (
+        "acknowledge_refusal_and_recheck_target",
+        "express_interest_request_improvement",
+        "ask_absolute_best_price",
+    ):
+        result = write_buyer_message(
+            intent=intent,
+            case_data=case_data,
+            supplier=SUPPLIER,
+            item_targets=MULTI_ITEM_TARGETS,
+            use_llm=False,
+        )
+
+        assert result["success"] is True
+        message = result["message"]
+        assert "Tanzanite (TAN)" in message
+        assert "Ruby (RBN)" in message
+
+
+def test_round_2_fallback_without_item_targets_is_unchanged() -> None:
+    """Legacy single-item negotiation rounds (no item_targets) must keep
+    using the original single-value wording."""
+    case_data = {
+        "case_number": "TAN-2026-08-08-01",
+        "item_material": "Tanzanite (TAN)",
+        "quantity": 40.0,
+        "notes": None,
+    }
+
+    result = write_buyer_message(
+        intent="acknowledge_refusal_and_recheck_target",
+        case_data=case_data,
+        supplier=SUPPLIER,
+        target_price_usd=36.0,
+        use_llm=False,
+    )
+
+    assert result["success"] is True
+    assert "Tanzanite (TAN)" in result["message"]
+    assert "36.0" in result["message"] or "36" in result["message"]
