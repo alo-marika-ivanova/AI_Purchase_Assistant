@@ -11,6 +11,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from app.db.repository import PurchasingRepository
+from app.services.brilliant_lot_parser import try_build_brilliant_lot_offer_text
 from app.services.simple_chat_service import send_or_display_outbound_message
 
 repo = PurchasingRepository()
@@ -143,3 +144,22 @@ def extract_text_from_spreadsheet(file_bytes: bytes, filename: str) -> str:
         "Unsupported file type for a supplier reply upload. "
         "Use .csv, .xlsx, or .xlsm."
     )
+
+
+def extract_supplier_reply_text(file_bytes: bytes, filename: str) -> str:
+    """Turn a supplier reply attachment into the text the classifier reads.
+
+    Tries the brilliant-lot deterministic parser first (see
+    brilliant_lot_parser.py): a returned, filled-in copy of the
+    brilliant-lot RFQ template has merged cells whose lot boundaries
+    extract_text_from_spreadsheet's generic cell-by-cell flattening would
+    destroy. When the file doesn't match that layout, or matches it only
+    partially/ambiguously, this falls back to the generic flattened dump
+    exactly as before - so natural-stone replies and any other file type
+    are completely unaffected.
+    """
+    lot_text = try_build_brilliant_lot_offer_text(file_bytes, filename)
+    if lot_text is not None:
+        return lot_text
+
+    return extract_text_from_spreadsheet(file_bytes, filename)

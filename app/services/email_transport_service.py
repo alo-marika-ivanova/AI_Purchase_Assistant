@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from app.db.repository import PurchasingRepository
 from app.integrations.graph_email_adapter import list_recent_inbox_messages
 from app.services.attachment_service import (
-    extract_text_from_spreadsheet,
+    extract_supplier_reply_text,
     save_case_attachment,
 )
 from app.services.simple_chat_service import (
@@ -93,7 +93,7 @@ def _build_display_body_and_analysis_text(
         if not filename.lower().endswith(_SPREADSHEET_EXTENSIONS):
             continue
         try:
-            extracted = extract_text_from_spreadsheet(
+            extracted = extract_supplier_reply_text(
                 attachment["content_bytes"], filename
             )
         except Exception as exc:

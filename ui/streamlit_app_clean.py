@@ -18,7 +18,7 @@ from app.services.case_service import (
     list_cases,
 )
 from app.services.attachment_service import (
-    extract_text_from_spreadsheet,
+    extract_supplier_reply_text,
     list_case_attachments,
     save_case_attachment,
     send_case_attachment,
@@ -236,6 +236,7 @@ def _render_detected_rfq_case_creation(
             pending_items.append(
                 {
                     "item_material": item.display_name,
+                    "description": item.description,
                     "quantity": item_quantity,
                     "supplier_ids": [
                         item_supplier_labels[label]
@@ -1383,7 +1384,7 @@ with main_col:
                 analysis_text = None
 
                 if supplier_reply_file is not None:
-                    extracted_text = extract_text_from_spreadsheet(
+                    extracted_text = extract_supplier_reply_text(
                         supplier_reply_file.getvalue(),
                         supplier_reply_file.name,
                     )
