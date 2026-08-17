@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import smtplib
 import ssl
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import make_msgid
 
@@ -49,6 +51,7 @@ def send_email_message(
     body: str,
     in_reply_to: str | None = None,
     references: str | None = None,
+    attachments: list[dict] | None = None,
 ) -> dict:
     """
     Send one email message using SMTP.
@@ -58,6 +61,10 @@ def send_email_message(
     - In-Reply-To and References are added when available.
 
     This improves mailbox threading, but final grouping still depends on the email provider/client.
+
+    ``attachments``, when given, is a list of
+    ``{"filename": str, "content": bytes, "mime_type": str | None}`` dicts;
+    the message is sent as multipart/mixed with each one attached as a file.
 
     Returns a dict that always includes ``delivery_outcome``, one of:
     - "sent": the SMTP server accepted the message;
@@ -104,6 +111,11 @@ def send_email_message(
         print("IN-REPLY-TO:", in_reply_to)
         print("REFERENCES:", references)
         print("BODY:", body)
+        if attachments:
+            print(
+                "ATTACHMENTS:",
+                ", ".join(a["filename"] for a in attachments),
+            )
 
         return {
             "success": True,
@@ -127,7 +139,21 @@ def send_email_message(
             "error": "Missing SMTP configuration in .env.",
         }
 
-    msg = MIMEText(body, "plain", "utf-8")
+    if attachments:
+        msg = MIMEMultipart()
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        for attachment in attachments:
+            part = MIMEApplication(
+                attachment["content"], Name=attachment["filename"]
+            )
+            part["Content-Disposition"] = (
+                f'attachment; filename="{attachment["filename"]}"'
+            )
+            msg.attach(part)
+    else:
+        msg = MIMEText(body, "plain", "utf-8")
+
     msg["Subject"] = subject
     msg["From"] = smtp_user
     msg["To"] = final_to_email

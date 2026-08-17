@@ -38,9 +38,16 @@ _INTENT_BY_STRATEGY = {
 class NegotiationRoundPlan:
     """One deterministically chosen negotiation round.
 
-    ``requested_price_usd`` is always the case's fixed target price -- the
-    strategies differ in tone/framing across rounds, not in what number is
-    asked for.
+    ``requested_price_usd`` is the case's fixed target price for a
+    single-item case; for a multi-item order it is the lowest of the
+    still-pending items' own targets (see ``item_targets``), kept only for
+    round-tracking/audit purposes - the strategies differ in tone/framing
+    across rounds, not in what number is asked for.
+
+    ``item_targets``, when given, is the per-item breakdown (one entry per
+    item still above its own target) that the caller should also pass
+    through to ``write_buyer_message`` - the same per-item price context
+    already used for round 1's initial discount request.
     """
 
     round_number: int
@@ -48,6 +55,7 @@ class NegotiationRoundPlan:
     llm_intent: str
     requested_price_usd: float
     extra_context: str
+    item_targets: list[dict] | None = None
 
 
 def strategy_for_round(round_number: int) -> str:
@@ -70,7 +78,62 @@ def _extra_context_for_round(
     round_number: int,
     target_price_usd: float,
     supplier_best_price_usd: float,
+    item_targets: list[dict] | None = None,
 ) -> str:
+    if item_targets:
+        item_summary = "; ".join(
+            f"{entry['item_material']}: current USD "
+            f"{entry['best_price_usd']:.2f}, target USD "
+            f"{entry['target_price_usd']:.2f}"
+            for entry in item_targets
+        )
+
+        if round_number == 1:
+            return (
+                "Ask specifically whether the supplier can reach each "
+                f"item's own target individually - {item_summary}. This is "
+                "the first price-negotiation message. Keep it concise, "
+                "natural, commercially firm, and polite. Do not say that "
+                "an order is confirmed. Do not invent a deadline or other "
+                "conditions."
+            )
+
+        if round_number == 2:
+            return (
+                "The supplier declined at least one item's target. "
+                "Acknowledge their previous answer politely, and ask them "
+                "to check once more (for example with their supplier or "
+                "management) whether each item still above target can "
+                f"reach it after all - {item_summary}. Do not sound pushy "
+                "or repeat the exact same wording as before. Do not "
+                "invent new facts or deadlines."
+            )
+
+        if round_number == 3:
+            return (
+                "The supplier has declined at least one item's target "
+                "more than once. Express genuine interest in working with "
+                "them and ask for one more concrete price improvement, "
+                f"per item still above target - {item_summary}. Make "
+                "clear this is an important opportunity for them, without "
+                "promising a guaranteed order or naming competitors."
+            )
+
+        if round_number == 4:
+            return (
+                "This is the final price-negotiation message with this "
+                "supplier before finalizing the comparison. Ask for their "
+                "absolute best possible final USD unit price for each "
+                f"item still above target - {item_summary}. Make clear "
+                "this is the last opportunity to improve the offer before "
+                "a decision is made. Do not disclose competitor names or "
+                "prices, and do not promise a guaranteed order."
+            )
+
+        raise ValueError(
+            f"No negotiation strategy is defined for round {round_number}."
+        )
+
     target_text = f"{target_price_usd:.2f}"
     current_text = f"{supplier_best_price_usd:.2f}"
 
@@ -121,6 +184,7 @@ def plan_negotiation_round(
     round_number: int,
     target_price_usd: float,
     supplier_best_price_usd: float,
+    item_targets: list[dict] | None = None,
 ) -> NegotiationRoundPlan:
     """Deterministically choose the strategy, intent, and requested price
     for one negotiation round. The communication writer only phrases this
@@ -136,7 +200,9 @@ def plan_negotiation_round(
             round_number=round_number,
             target_price_usd=float(target_price_usd),
             supplier_best_price_usd=float(supplier_best_price_usd),
+            item_targets=item_targets,
         ),
+        item_targets=item_targets,
     )
 
 

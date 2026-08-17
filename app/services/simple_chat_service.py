@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import difflib
+import re
+import unicodedata
 from datetime import datetime
 
 from app.db.repository import PurchasingRepository
@@ -35,6 +38,214 @@ from app.llm.supplier_message_classifier import (
 )
 
 repo = PurchasingRepository()
+
+
+# Below this fuzzy-match score, or without a clear margin over the next-best
+# linked item, a supplier's item name is left unresolved rather than guessed.
+# An order can contain more than one similarly named stone (e.g. two garnet
+# colors) - a wrong guess would silently misattribute a real price.
+_ITEM_NAME_MATCH_THRESHOLD = 0.72
+_ITEM_NAME_MATCH_MARGIN = 0.08
+
+
+def _normalize_item_name_for_matching(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def _containment_score(target: str, candidate: str) -> float:
+    if target in candidate or candidate in target:
+        shorter, longer = sorted((len(target), len(candidate)))
+        return 1.0 - 0.3 * (1 - shorter / longer)
+    return difflib.SequenceMatcher(None, target, candidate).ratio()
+
+
+# A windowed fragment must cover at least this fraction of the other side's
+# length to be scored via the lenient containment formula below - otherwise
+# a single generic shared word (e.g. "garnet") would look like a strong
+# match against a much longer, genuinely different name that merely starts
+# with it (e.g. "Garnet Hessonite" vs "Garnet pink round regular 5 mm").
+# This only guards the windowed extension; the existing whole-string
+# comparison (unwindowed) is unchanged, since that already relies on it.
+_WINDOW_MIN_LENGTH_RATIO = 0.6
+
+
+def _item_name_match_score(target: str, candidate: str) -> float:
+    """Fuzzy-match a supplier-stated item name against a case's stored
+    item_material.
+
+    A supplier filling in a price next to a pre-populated line-item
+    description often echoes the FULL description back (e.g. "peridot
+    round regular 2 mm"), while the case's own item_material can be just
+    the short catalog name ("Peridote (PER)") - itself sometimes a minor
+    spelling variant of the supplier's wording (peridot/peridote). Scoring
+    the two full strings against each other via SequenceMatcher penalizes
+    that length gap even though the core stone name is a near-exact match.
+    Trying progressively shorter leading-word windows of each side -
+    mirroring rfq_detection_service._best_catalog_match - finds that match
+    instead of just comparing the whole phrases; the existing best-vs-second
+    margin check in _resolve_case_item_id is what keeps this from
+    conflating two genuinely different items that merely share a first
+    word (e.g. "Garnet Pink" vs "Garnet Hessonite" - see
+    _WINDOW_MIN_LENGTH_RATIO above for the other half of that guard).
+    """
+    if not target or not candidate:
+        return 0.0
+
+    best_score = _containment_score(target, candidate)
+
+    for text, other in ((target, candidate), (candidate, target)):
+        tokens = text.split()
+        for window in range(min(4, len(tokens)), 0, -1):
+            windowed = " ".join(tokens[:window])
+            shorter, longer = sorted((len(windowed), len(other)))
+            if longer == 0 or shorter / longer < _WINDOW_MIN_LENGTH_RATIO:
+                continue
+            best_score = max(best_score, _containment_score(windowed, other))
+
+    return best_score
+
+
+def _resolve_case_item_id(
+    item_material: str, supplier_items: list[dict]
+) -> int | None:
+    """Match a supplier-stated item name back to one of this supplier's
+    linked case items.
+
+    Suppliers rarely repeat a case item's full catalog string (which often
+    carries a trailing code, e.g. "Peridote (PER)") - they write short,
+    casual, sometimes misspelled names ("peridot", "garnet"). An exact
+    match is tried first; if that fails, a normalized fuzzy match is used,
+    but only when exactly one linked item is a confident, unambiguous
+    match - if two linked items are both plausible, neither is guessed and
+    the entry is left unresolved (skipped by the caller)."""
+    normalized_target = item_material.strip().lower()
+    for item in supplier_items:
+        if item["item_material"].strip().lower() == normalized_target:
+            return int(item["id"])
+
+    fuzzy_target = _normalize_item_name_for_matching(item_material)
+    if not fuzzy_target:
+        return None
+
+    scored = sorted(
+        (
+            (
+                _item_name_match_score(
+                    fuzzy_target,
+                    _normalize_item_name_for_matching(item["item_material"]),
+                ),
+                item,
+            )
+            for item in supplier_items
+        ),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+
+    if not scored or scored[0][0] < _ITEM_NAME_MATCH_THRESHOLD:
+        return None
+
+    if len(scored) > 1 and scored[0][0] - scored[1][0] < _ITEM_NAME_MATCH_MARGIN:
+        return None
+
+    return int(scored[0][1]["id"])
+
+
+def _item_offers_fully_confirm_supplier_items(
+    item_offers: list[dict] | None, supplier_items: list[dict]
+) -> bool:
+    """True when every item this supplier was asked to quote already has a
+    resolved, CONFIRMED per-item price in item_offers - i.e. there is
+    nothing left for the analyzer to legitimately need clarification about,
+    regardless of what its whole-message recommended_action says."""
+    if not item_offers or not supplier_items:
+        return False
+
+    confirmed_ids: set[int] = set()
+    for entry in item_offers:
+        if str(entry.get("price_certainty") or "").upper() != "CONFIRMED":
+            continue
+        try:
+            price = float(entry.get("unit_price_usd"))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+        case_item_id = _resolve_case_item_id(
+            entry.get("item_material", ""), supplier_items
+        )
+        if case_item_id is not None:
+            confirmed_ids.add(case_item_id)
+
+    return confirmed_ids == {int(item["id"]) for item in supplier_items}
+
+
+def _save_multi_item_offers(
+    case_id: int,
+    supplier_id: int,
+    item_offers: list[dict],
+    supplier_items: list[dict],
+    message_id: int,
+    extraction_method: str,
+    confidence: str,
+    reason: str,
+) -> list[dict]:
+    """Save one offer per item_offers entry that matches one of this
+    supplier's linked items. An entry whose item_material doesn't match any
+    linked item is skipped rather than guessed at.
+
+    Returns the list of items actually saved, each as {case_item_id,
+    item_material, unit_price_usd, offer_id, status}.
+    """
+    saved: list[dict] = []
+
+    for entry in item_offers:
+        case_item_id = _resolve_case_item_id(
+            entry["item_material"], supplier_items
+        )
+        if case_item_id is None:
+            continue
+
+        status = (
+            "provisional"
+            if entry.get("price_certainty") == "TENTATIVE"
+            else "active"
+        )
+
+        repo.supersede_provisional_offers_for_case_item_supplier(
+            case_item_id=case_item_id,
+            supplier_id=supplier_id,
+            reason="Superseded by a newer price for this item.",
+        )
+
+        offer_id = add_offer(
+            case_id=case_id,
+            supplier_id=supplier_id,
+            unit_price_usd=float(entry["unit_price_usd"]),
+            quantity=None,
+            message_id=message_id,
+            extraction_method=extraction_method,
+            extraction_confidence=confidence,
+            notes=reason,
+            status=status,
+            case_item_id=case_item_id,
+        )
+
+        saved.append(
+            {
+                "case_item_id": case_item_id,
+                "item_material": entry["item_material"],
+                "unit_price_usd": entry["unit_price_usd"],
+                "offer_id": offer_id,
+                "status": status,
+            }
+        )
+
+    return saved
 
 
 def _parse_service_datetime(value: str | None) -> datetime | None:
@@ -449,6 +660,7 @@ def send_or_display_outbound_message(
     send_email: bool = False,
     send_whatsapp: bool = False,
     send_real_message: bool | None = None,
+    attachment_ids: list[int] | None = None,
 ) -> dict:
     """Store an outbound message and deliver it according to case mode.
 
@@ -460,6 +672,15 @@ def send_or_display_outbound_message(
     real case, but they cannot turn a simulation case into a real one.
     ``send_real_message`` is retained only for backward-compatible callers and
     is intentionally not used as a mode override.
+
+    ``attachment_ids``, when given, links copies of those existing
+    case attachments to the new message *before* it is sent, so an email
+    delivery (immediate or a later automatic retry) picks them up by
+    looking them up from the message_id - see
+    transport_delivery_service.deliver_claimed_email_job. A WhatsApp-channel
+    supplier still only gets the text: the WhatsApp integration has no
+    document-sending support yet, so the file is recorded but not
+    transmitted over that channel.
     """
     clean_body = body.strip()
     if not clean_body:
@@ -508,6 +729,27 @@ def send_or_display_outbound_message(
         approved_by_buyer=True,
     )
 
+    linked_attachment_ids = []
+    for source_attachment_id in attachment_ids or []:
+        source = repo.get_attachment_by_id(int(source_attachment_id))
+        if source is None or int(source["case_id"]) != case_id:
+            continue
+
+        linked_attachment_ids.append(
+            repo.add_attachment(
+                case_id=case_id,
+                original_filename=source["original_filename"],
+                stored_path=source["stored_path"],
+                mime_type=source["mime_type"],
+                size_bytes=source["size_bytes"],
+                sha256_hash=source["sha256_hash"],
+                supplier_id=supplier_id,
+                message_id=message_id,
+                channel=channel,
+                direction="outbound",
+            )
+        )
+
     send_result = None
 
     if real_channel == "email":
@@ -521,6 +763,7 @@ def send_or_display_outbound_message(
         "send_real_message": bool(real_channel),
         "real_channel": real_channel,
         "send_result": send_result,
+        "attachment_ids": linked_attachment_ids,
     }
 
 
@@ -529,15 +772,28 @@ def record_supplier_message_simple(
     supplier_id: int,
     channel: str,
     body: str,
+    analysis_text: str | None = None,
 ) -> dict:
     """
     Save and semantically interpret one inbound supplier message.
 
     Ollama interprets the language. Deterministic application code decides
     which state transition is allowed.
+
+    ``analysis_text``, when given, is what the classifier reads instead of
+    ``body`` - used when the buyer simulates a supplier reply that arrived
+    as an attached file: ``body`` stays a short human-facing note (stored
+    and shown in the chat) while ``analysis_text`` carries the file's
+    extracted content, so the chat stays readable and the attachment's own
+    download link is what surfaces the full content, not a wall of
+    flattened spreadsheet text.
     """
     clean_body = body.strip()
     if not clean_body:
+        raise ValueError("Supplier message body is required.")
+
+    text_for_analysis = (analysis_text or body).strip()
+    if not text_for_analysis:
         raise ValueError("Supplier message body is required.")
 
     repo.ensure_supplier_linked_to_case(case_id, supplier_id)
@@ -576,6 +832,7 @@ def record_supplier_message_simple(
             supplier_id=supplier_id,
             channel=channel,
             body=clean_body,
+            analysis_text=analysis_text,
         )
 
     inbound_message_id = repo.add_message(
@@ -604,6 +861,15 @@ def record_supplier_message_simple(
     if case_data is None:
         raise ValueError("Case not found.")
 
+    # An order-case can hold several items shared across different
+    # suppliers; the classifier must only see (and price) the items THIS
+    # supplier was actually linked to. Legacy single-item cases have no
+    # case_items rows, so supplier_items stays empty and case_data is
+    # unchanged - the classifier's single-item behavior is unaffected.
+    supplier_items = repo.list_case_items_for_supplier(case_id, supplier_id)
+    if supplier_items:
+        case_data = {**case_data, "items": supplier_items}
+
     supplier = _find_case_supplier(case_id, supplier_id)
 
     supplier_state = supplier_state_before_reply
@@ -623,7 +889,7 @@ def record_supplier_message_simple(
         else "RFQ"
     )
 
-    supplier_text = _extract_supplier_authored_text(clean_body)
+    supplier_text = _extract_supplier_authored_text(text_for_analysis)
 
     latest_provisional_offer = (
         repo.get_latest_provisional_offer_for_case_supplier(
@@ -645,10 +911,16 @@ def record_supplier_message_simple(
             if latest_provisional_offer is not None
             else None
         ),
+        is_attachment_reply=analysis_text is not None,
     )
 
     analyzer_recommended_action = analysis.get("recommended_action")
-    policy_decision = decide_supplier_message_policy(analysis)
+    item_offers_fully_confirmed = _item_offers_fully_confirm_supplier_items(
+        analysis.get("item_offers"), supplier_items
+    )
+    policy_decision = decide_supplier_message_policy(
+        analysis, item_offers_fully_confirmed=item_offers_fully_confirmed
+    )
     analysis = {
         **analysis,
         "analyzer_recommended_action": analyzer_recommended_action,
@@ -715,6 +987,68 @@ def record_supplier_message_simple(
         }
 
     if action == "SAVE_PROVISIONAL_OFFER_AND_WAIT":
+        item_offers = analysis.get("item_offers")
+
+        if item_offers and supplier_items:
+            saved_items = _save_multi_item_offers(
+                case_id=case_id,
+                supplier_id=supplier_id,
+                item_offers=item_offers,
+                supplier_items=supplier_items,
+                message_id=inbound_message_id,
+                extraction_method=extraction_method,
+                confidence=analysis.get("confidence", "low"),
+                reason=analysis.get("reason", ""),
+            )
+
+            if not saved_items:
+                return pause_for_review(
+                    review_type="invalid_item_offer_result",
+                    reason=(
+                        "The analyzer identified item-level price(s) but "
+                        "none matched an item linked to this supplier."
+                    ),
+                )
+
+            repo.set_supplier_state(
+                case_id=case_id,
+                supplier_id=supplier_id,
+                state=SupplierState.AWAITING_PRICE_CONFIRMATION.value,
+            )
+            repo.set_supplier_policy_state(
+                case_id=case_id,
+                supplier_id=supplier_id,
+                state=SupplierState.AWAITING_PRICE_CONFIRMATION.value,
+            )
+
+            item_summary = ", ".join(
+                f"{item['item_material']}: USD {item['unit_price_usd']} "
+                f"({item['status']})"
+                for item in saved_items
+            )
+            repo.update_case_status_with_event(
+                case_id=case_id,
+                status=CaseState.COLLECTING_OFFERS.value,
+                event_type="provisional_supplier_price_recorded",
+                details=f"Supplier stated price(s) for: {item_summary}.",
+            )
+
+            return {
+                "inbound_message_id": inbound_message_id,
+                "analysis": analysis,
+                "classification": analysis,
+                "extraction": {
+                    "item_offers": saved_items,
+                    "confidence": analysis.get("confidence", "low"),
+                    "method": extraction_method,
+                    "needs_review": False,
+                    "reason": analysis.get("reason", ""),
+                },
+                "saved_offer_id": saved_items[0]["offer_id"],
+                "saved_offer_ids": [item["offer_id"] for item in saved_items],
+                "review_item_id": None,
+            }
+
         unit_price_usd = analysis.get("unit_price_usd")
 
         if unit_price_usd is None:
@@ -786,6 +1120,100 @@ def record_supplier_message_simple(
         }
 
     if action == "SAVE_OFFER":
+        item_offers = analysis.get("item_offers")
+
+        if item_offers and supplier_items:
+            saved_items = _save_multi_item_offers(
+                case_id=case_id,
+                supplier_id=supplier_id,
+                item_offers=item_offers,
+                supplier_items=supplier_items,
+                message_id=inbound_message_id,
+                extraction_method=extraction_method,
+                confidence=analysis.get("confidence", "low"),
+                reason=analysis.get("reason", ""),
+            )
+
+            if not saved_items:
+                return pause_for_review(
+                    review_type="invalid_item_offer_result",
+                    reason=(
+                        "The classifier recommended saving item-level "
+                        "offers but none matched an item linked to this "
+                        "supplier."
+                    ),
+                )
+
+            repo.set_supplier_state(
+                case_id=case_id,
+                supplier_id=supplier_id,
+                state=SupplierState.PRICE_EXTRACTED.value,
+            )
+
+            best_active_price = min(
+                (
+                    item["unit_price_usd"]
+                    for item in saved_items
+                    if item["status"] == "active"
+                ),
+                default=None,
+            )
+
+            if supplier_state_before_reply == SupplierState.NO_RESPONSE.value:
+                repo.update_case_status_with_event(
+                    case_id=case_id,
+                    status=CaseState.COLLECTING_OFFERS.value,
+                    event_type="late_supplier_response_recorded",
+                    details=(
+                        "Supplier replied after being marked NO_RESPONSE "
+                        f"with price(s) for {len(saved_items)} item(s)."
+                    ),
+                )
+
+            repo.set_supplier_policy_state(
+                case_id=case_id,
+                supplier_id=supplier_id,
+                state=SupplierState.PRICE_EXTRACTED.value,
+                best_offer_usd=best_active_price,
+            )
+
+            case_status = (
+                CaseState.NEGOTIATING.value
+                if case_data.get("status") == CaseState.NEGOTIATING.value
+                else CaseState.COLLECTING_OFFERS.value
+            )
+
+            item_summary = ", ".join(
+                f"{item['item_material']}: USD {item['unit_price_usd']} "
+                f"({item['status']})"
+                for item in saved_items
+            )
+            repo.update_case_status_with_event(
+                case_id=case_id,
+                status=case_status,
+                event_type="supplier_offer_recorded",
+                details=(
+                    f"Supplier response recorded for: {item_summary}. "
+                    f"LLM category: {analysis['message_category']}."
+                ),
+            )
+
+            return {
+                "inbound_message_id": inbound_message_id,
+                "analysis": analysis,
+                "classification": analysis,
+                "extraction": {
+                    "item_offers": saved_items,
+                    "confidence": analysis.get("confidence", "low"),
+                    "method": extraction_method,
+                    "needs_review": False,
+                    "reason": analysis.get("reason", ""),
+                },
+                "saved_offer_id": saved_items[0]["offer_id"],
+                "saved_offer_ids": [item["offer_id"] for item in saved_items],
+                "review_item_id": None,
+            }
+
         unit_price_usd = analysis.get("unit_price_usd")
 
         if unit_price_usd is None:
@@ -1035,8 +1463,12 @@ def record_supplier_message_simple(
     return pause_for_review(
         review_type=analysis.get("message_category", "UNKNOWN"),
         reason=(
-            analysis.get("reason")
-            or "The message requires human review."
+            (analysis.get("reason") or "The message requires human review.")
+            + (
+                f" (LLM error: {analysis['error']})"
+                if analysis.get("error")
+                else ""
+            )
         ),
     )
 
@@ -1194,6 +1626,107 @@ def build_supplier_overview(case_id: int) -> list[dict]:
     return rows
 
 
+def build_item_supplier_overview(case_id: int) -> list[dict]:
+    """Per-item comparison for an order-case: one entry per case_item, each
+    with its own list of linked suppliers and their current offer for THAT
+    item specifically - unlike build_supplier_overview, which collapses a
+    supplier's items into a single case-wide "best price" and is only
+    correct when a case has no case_items (a legacy single-item case)."""
+    items = repo.list_case_items(case_id)
+    rows = []
+
+    for item in items:
+        case_item_id = int(item["id"])
+        provisional_by_supplier = {
+            int(offer["supplier_id"]): offer
+            for offer in repo.get_latest_provisional_offer_for_case_item(
+                case_item_id
+            )
+        }
+
+        supplier_rows = []
+        for supplier in item.get("suppliers", []):
+            supplier_id = int(supplier["id"])
+            best_offer = repo.get_best_offer_for_case_item_supplier(
+                case_item_id, supplier_id
+            )
+            provisional_offer = provisional_by_supplier.get(supplier_id)
+
+            supplier_rows.append(
+                {
+                    "supplier_id": supplier_id,
+                    "supplier": supplier["name"],
+                    "best_unit_price_usd": (
+                        best_offer["unit_price_usd"] if best_offer else None
+                    ),
+                    "offer_id": best_offer["offer_id"] if best_offer else None,
+                    "provisional_unit_price_usd": (
+                        provisional_offer["unit_price_usd"]
+                        if provisional_offer
+                        else None
+                    ),
+                }
+            )
+
+        rows.append(
+            {
+                "case_item_id": case_item_id,
+                "item_material": item["item_material"],
+                "quantity": item["quantity"],
+                "suppliers": supplier_rows,
+                "winner": repo.get_winner_decision_for_case_item(case_item_id),
+            }
+        )
+
+    return rows
+
+
+def build_supplier_rollup_overview(case_id: int) -> list[dict]:
+    """Per-supplier rollup across every item they're linked to in an
+    order-case - a quick supplier-centric read-only scan. Winner decisions
+    are made per item (see build_item_supplier_overview); this view has no
+    notify actions, since "notify this supplier" is no longer well-defined
+    at the whole-case level once different items can go to different
+    suppliers."""
+    suppliers = repo.list_case_suppliers(case_id)
+    items = repo.list_case_items(case_id)
+
+    rows = []
+    for supplier in suppliers:
+        supplier_id = int(supplier["id"])
+        item_prices = []
+
+        for item in items:
+            item_supplier_ids = {
+                int(s["id"]) for s in item.get("suppliers", [])
+            }
+            if supplier_id not in item_supplier_ids:
+                continue
+
+            best_offer = repo.get_best_offer_for_case_item_supplier(
+                int(item["id"]), supplier_id
+            )
+            item_prices.append(
+                {
+                    "item_material": item["item_material"],
+                    "unit_price_usd": (
+                        best_offer["unit_price_usd"] if best_offer else None
+                    ),
+                }
+            )
+
+        rows.append(
+            {
+                "supplier_id": supplier_id,
+                "supplier": supplier["name"],
+                "code": supplier["supplier_code"],
+                "items": item_prices,
+            }
+        )
+
+    return rows
+
+
 def generate_and_send_winner_notification_for_supplier(
     case_id: int,
     supplier_id: int,
@@ -1269,6 +1802,110 @@ def generate_and_send_winner_notification_for_supplier(
         "send_result": send_result,
     }
 
+
+
+def generate_and_send_winner_notification_for_case_item(
+    case_id: int,
+    case_item_id: int,
+    supplier_id: int,
+    send_email: bool = False,
+    send_real_message: bool | None = None,
+) -> dict:
+    """Per-item winner notification for an order-case: notifies one
+    supplier that they won one specific item, not the whole order. A
+    different item in the same order can separately notify a different
+    supplier as its own winner."""
+    case_data = repo.get_case_basic(case_id)
+    if case_data is None:
+        raise ValueError("Case not found.")
+
+    item = next(
+        (
+            row
+            for row in repo.list_case_items(case_id)
+            if int(row["id"]) == case_item_id
+        ),
+        None,
+    )
+    if item is None:
+        raise ValueError("Item not found for this case.")
+
+    supplier = _find_case_supplier(case_id, supplier_id)
+    best_offer = repo.get_best_offer_for_case_item_supplier(
+        case_item_id, supplier_id
+    )
+
+    if best_offer is None:
+        raise ValueError(
+            "Selected supplier has no confirmed offer for this item."
+        )
+
+    repo.approve_winner(
+        case_id=case_id,
+        offer_id=int(best_offer["offer_id"]),
+        reason=(
+            "Buyer clicked notify winner button for this item. "
+            "This supplier was selected manually by the buyer."
+        ),
+    )
+
+    history = repo.list_messages_for_case_supplier(case_id, supplier_id)
+    winning_price = float(best_offer["unit_price_usd"])
+
+    # Override item_material/quantity (not just "items") so the
+    # deterministic fallback template - which reads those fields directly,
+    # not the items list - also mentions this specific item rather than the
+    # whole order's summary label.
+    item_scoped_case_data = {
+        **case_data,
+        "item_material": item["item_material"],
+        "quantity": item["quantity"],
+        "items": [item],
+    }
+
+    message_result = write_buyer_message(
+        intent="winner_notification",
+        case_data=item_scoped_case_data,
+        supplier=supplier,
+        message_history=history,
+        winning_price_usd=winning_price,
+        extra_context=(
+            "The buyer clicked the winner notification button for this "
+            "specific item (this order has multiple items; mention only "
+            "this one, not the others). Write a careful professional "
+            "notification that this supplier was selected for this item. "
+            "Do not mention AI or automation."
+        ),
+    )
+
+    result = send_or_display_outbound_message(
+        case_id=case_id,
+        supplier_id=supplier_id,
+        body=message_result["message"],
+        message_type="winner_notification",
+        send_email=send_email,
+    )
+
+    send_result = result.get("send_result")
+
+    if send_result is None or send_result.get("success"):
+        repo.log_worker_event(
+            case_id=case_id,
+            event_type="item_winner_notification_sent",
+            details=(
+                f"Winner notification generated for {supplier['name']} "
+                f"on {item['item_material']} at USD {winning_price}."
+            ),
+        )
+
+    return {
+        "winner_supplier": supplier,
+        "item_material": item["item_material"],
+        "winning_price": winning_price,
+        "message": message_result["message"],
+        "message_method": message_result.get("method"),
+        "send_result": send_result,
+    }
 
 
 def get_suggested_winner(case_id: int) -> dict | None:
@@ -1402,31 +2039,76 @@ def execute_negotiation_rule_action(
         action.case_id
     )
 
-    is_initial_best_supplier = bool(
-        context
-        and int(context["best_supplier_id"])
-        == int(action.supplier_id)
-    )
+    if action.item_targets:
+        # Each item can have its own best offer and target; a case-wide
+        # "best initial offer" claim would be misleading here (a supplier
+        # can be cheapest on one item and not another), so no ranking
+        # framing is given at all.
+        supplier_position_context = (
+            "Do not mention competitors, rankings, or any competing "
+            "price for any item."
+        )
+        item_lines = "\n".join(
+            f"- {entry['item_material']}: current offer USD "
+            f"{entry['best_price_usd']:.2f} per unit, ask whether "
+            f"USD {entry['target_price_usd']:.2f} per unit is possible"
+            for entry in action.item_targets
+        )
+        extra_context = (
+            "This order has multiple items, each with its own current "
+            "offer and its own target price - ask about EACH item "
+            f"individually, do not blend them into one shared number:\n"
+            f"{item_lines}\n"
+            f"{supplier_position_context} "
+            "This is the first price-negotiation message. Keep it concise, "
+            "natural, commercially firm, and polite. Do not say that an "
+            "order is confirmed. Do not invent a deadline or other "
+            "conditions."
+        )
+        supplier_items = repo.list_case_items_for_supplier(
+            action.case_id, action.supplier_id
+        )
+        quantity_by_item_id = {
+            item["id"]: item["quantity"] for item in supplier_items
+        }
+        case_data = {
+            **case_data,
+            "items": [
+                {
+                    "item_material": entry["item_material"],
+                    "quantity": quantity_by_item_id.get(
+                        entry["case_item_id"]
+                    ),
+                }
+                for entry in action.item_targets
+            ],
+        }
+    else:
+        is_initial_best_supplier = bool(
+            context
+            and int(context["best_supplier_id"])
+            == int(action.supplier_id)
+        )
 
-    supplier_position_context = (
-        "This supplier currently has the best initial offer, but do not "
-        "tell them that and do not weaken the negotiation request."
-        if is_initial_best_supplier
-        else
-        "This supplier's offer is not the best initial offer, but do not "
-        "mention competitors, rankings, or any competing price."
-    )
+        supplier_position_context = (
+            "This supplier currently has the best initial offer, but do not "
+            "tell them that and do not weaken the negotiation request."
+            if is_initial_best_supplier
+            else
+            "This supplier's offer is not the best initial offer, but do not "
+            "mention competitors, rankings, or any competing price."
+        )
 
-    extra_context = (
-        f"The supplier's own current offer is USD "
-        f"{float(action.supplier_best_price_usd):.2f} per unit. "
-        f"Ask specifically whether they can reach USD "
-        f"{float(action.target_price_usd):.2f} per unit. "
-        f"{supplier_position_context} "
-        "This is the first price-negotiation message. Keep it concise, "
-        "natural, commercially firm, and polite. Do not say that an order "
-        "is confirmed. Do not invent a deadline or other conditions."
-    )
+        extra_context = (
+            f"The supplier's own current offer is USD "
+            f"{float(action.supplier_best_price_usd):.2f} per unit. "
+            f"Ask specifically whether they can reach USD "
+            f"{float(action.target_price_usd):.2f} per unit. "
+            f"{supplier_position_context} "
+            "This is the first price-negotiation message. Keep it concise, "
+            "natural, commercially firm, and polite. Do not say that an order "
+            "is confirmed. Do not invent a deadline or other conditions."
+        )
 
     message_result = write_buyer_message(
         intent=action.llm_intent or "ask_for_target_price",
@@ -1437,6 +2119,7 @@ def execute_negotiation_rule_action(
         supplier_best_price_usd=float(
             action.supplier_best_price_usd
         ),
+        item_targets=action.item_targets,
         extra_context=extra_context,
     )
 
@@ -1860,8 +2543,22 @@ def execute_rfq_rule_action(
     if action.supplier_id is None:
         raise ValueError("Supplier ID is required for supplier action.")
 
+    # An order-case can hold several items shared across different
+    # suppliers (case_items/case_item_suppliers); this supplier's message
+    # must only reference the items they were actually linked to, not the
+    # whole order. Legacy single-item cases have no case_items rows, so
+    # this is a no-op for them and case_data["items"] stays absent.
+    supplier_items = repo.list_case_items_for_supplier(
+        case_id=action.case_id,
+        supplier_id=action.supplier_id,
+    )
+    if supplier_items:
+        case_data = dict(case_data)
+        case_data["items"] = supplier_items
+
     policy = load_negotiation_policy()
     provisional_price_for_message: float | None = None
+    provisional_price_items: list[dict] | None = None
 
     # ------------------------------------------------------------------
     # Execution-level anti-duplicate and anti-spam guards.
@@ -2074,19 +2771,52 @@ def execute_rfq_rule_action(
                 ),
             }
 
-        provisional_offer = (
-            repo.get_latest_provisional_offer_for_case_supplier(
+        if supplier_items:
+            # Multi-item order: acknowledge EVERY item this supplier still
+            # has a provisional price for, not just the most recently saved
+            # one (the single-offer lookup used in the legacy branch below
+            # only returns one row for the whole case).
+            provisional_offers = repo.list_provisional_offers_for_case_supplier(
                 case_id=action.case_id,
                 supplier_id=action.supplier_id,
             )
-        )
-        if provisional_offer is None:
-            return {
-                "action": action.action_type,
-                "supplier_id": action.supplier_id,
-                "skipped": True,
-                "reason": "No provisional offer is available to acknowledge.",
-            }
+            if not provisional_offers:
+                return {
+                    "action": action.action_type,
+                    "supplier_id": action.supplier_id,
+                    "skipped": True,
+                    "reason": "No provisional offer is available to acknowledge.",
+                }
+
+            provisional_price_items = [
+                {
+                    "item_material": offer["item_material"],
+                    "unit_price_usd": float(offer["unit_price_usd"]),
+                }
+                for offer in provisional_offers
+            ]
+            provisional_offer_key = "-".join(
+                str(offer["offer_id"]) for offer in provisional_offers
+            )
+        else:
+            provisional_offer = (
+                repo.get_latest_provisional_offer_for_case_supplier(
+                    case_id=action.case_id,
+                    supplier_id=action.supplier_id,
+                )
+            )
+            if provisional_offer is None:
+                return {
+                    "action": action.action_type,
+                    "supplier_id": action.supplier_id,
+                    "skipped": True,
+                    "reason": "No provisional offer is available to acknowledge.",
+                }
+
+            provisional_price_for_message = float(
+                provisional_offer["unit_price_usd"]
+            )
+            provisional_offer_key = str(provisional_offer["offer_id"])
 
         acknowledgement_count = repo.count_supplier_outbound_message_type(
             case_id=action.case_id,
@@ -2117,12 +2847,9 @@ def execute_rfq_rule_action(
                 ),
             }
 
-        provisional_price_for_message = float(
-            provisional_offer["unit_price_usd"]
-        )
         action_key = (
             f"SEND_PROVISIONAL_PRICE_ACKNOWLEDGEMENT:"
-            f"{action.supplier_id}:{provisional_offer['offer_id']}"
+            f"{action.supplier_id}:{provisional_offer_key}"
         )
 
     elif action.action_type == "SEND_CASE_ANSWER":
@@ -2247,8 +2974,22 @@ def execute_rfq_rule_action(
         supplier=supplier,
         message_history=history,
         supplier_best_price_usd=provisional_price_for_message,
+        item_provisional_prices=provisional_price_items,
         extra_context=extra_context,
     )
+
+    # The buyer's originally-uploaded case file(s) (e.g. the RFQ workbook
+    # used to auto-detect items) ride along with the first RFQ sent to each
+    # supplier. "Not yet linked to any message" is what marks a case
+    # attachment as one of these originals, as opposed to one already sent
+    # elsewhere.
+    rfq_attachment_ids = None
+    if action.action_type == "SEND_RFQ":
+        rfq_attachment_ids = [
+            int(attachment["id"])
+            for attachment in repo.list_attachments_for_case(action.case_id)
+            if attachment.get("message_id") is None
+        ]
 
     result = send_or_display_outbound_message(
         case_id=action.case_id,
@@ -2257,6 +2998,7 @@ def execute_rfq_rule_action(
         message_type=action.message_type or "manual_note",
         send_email=send_email,
         send_real_message=send_real_message,
+        attachment_ids=rfq_attachment_ids,
     )
 
     send_result = result.get("send_result")

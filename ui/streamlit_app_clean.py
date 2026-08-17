@@ -12,13 +12,30 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.db.database import initialize_database
 from app.db.repository import PurchasingRepository
-from app.services.case_service import create_case, list_cases
+from app.services.case_service import (
+    create_case,
+    create_case_from_detected_items,
+    list_cases,
+)
+from app.services.attachment_service import (
+    extract_text_from_spreadsheet,
+    list_case_attachments,
+    save_case_attachment,
+    send_case_attachment,
+)
+from app.services.rfq_detection_service import (
+    RfqDetectionResult,
+    detect_rfq_selection,
+)
 from app.services.supplier_catalog_service import (
     list_material_choices,
     list_suppliers_for_material,
 )
 from app.services.simple_chat_service import (
+    build_item_supplier_overview,
     build_supplier_overview,
+    build_supplier_rollup_overview,
+    generate_and_send_winner_notification_for_case_item,
     generate_and_send_winner_notification_for_supplier,
     get_suggested_winner,
     record_supplier_message_simple,
@@ -81,9 +98,217 @@ def _describe_outbound_message_status(msg: dict) -> str:
 # Case creation dialog
 # ---------------------------------------------------------------------
 
-@st.dialog("Create new negotiation case", width="large")
-def show_create_case_dialog() -> None:
-    """Render case creation only when the buyer explicitly opens it."""
+def _merge_rfq_detection(uploaded_files) -> RfqDetectionResult:
+    """Run RFQ auto-detection across every uploaded file and merge hits.
+
+    The buyer may attach several files at once (e.g. an RFQ plus a
+    reference PDF); each is checked independently and any recognized items
+    are combined into one list.
+    """
+    if not uploaded_files:
+        return RfqDetectionResult(recognized=False)
+
+    file_type = None
+    items = []
+    unresolved_lines = []
+    recognized = False
+
+    for uploaded_file in uploaded_files:
+        result = detect_rfq_selection(uploaded_file.getvalue(), uploaded_file.name)
+        if result.recognized:
+            recognized = True
+            file_type = file_type or result.file_type
+            items.extend(result.items)
+            unresolved_lines.extend(result.unresolved_lines)
+
+    return RfqDetectionResult(
+        recognized=recognized,
+        file_type=file_type,
+        items=items,
+        unresolved_lines=unresolved_lines,
+    )
+
+
+def _attach_uploaded_files_to_cases(uploaded_files, case_ids: list[int]) -> list[str]:
+    """Save every uploaded file as an attachment on every given case.
+
+    One uploaded RFQ file can spawn several cases (one per detected item);
+    each case keeps its own copy of the source file, since Phase 1's
+    attachment model links one stored file to exactly one case.
+    """
+    errors = []
+    for case_id in case_ids:
+        for uploaded_file in uploaded_files or []:
+            try:
+                save_case_attachment(
+                    case_id=case_id,
+                    original_filename=uploaded_file.name,
+                    file_bytes=uploaded_file.getvalue(),
+                )
+            except Exception as exc:
+                errors.append(f"case {case_id} / {uploaded_file.name}: {exc}")
+
+    return errors
+
+
+def _render_detected_rfq_case_creation(
+    detection: RfqDetectionResult,
+    uploaded_files,
+) -> None:
+    """Auto-detected path: one case per recognized RFQ item, suppliers
+    pre-selected from the catalog. The buyer can still remove suppliers or
+    adjust quantity per item before creating the cases."""
+    st.success(
+        f"Recognized a {detection.file_type} RFQ with "
+        f"{len(detection.items)} item(s). One case will be created per item."
+    )
+
+    if detection.unresolved_lines:
+        with st.expander(
+            f"{len(detection.unresolved_lines)} line(s) could not be matched "
+            "to a catalog item",
+            expanded=False,
+        ):
+            for line in detection.unresolved_lines:
+                st.caption(line)
+
+    with st.form("create_cases_from_rfq_form"):
+        notes = st.text_area("Notes (applied to every case)", height=80)
+
+        auto_send_messages = st.checkbox(
+            "Send real messages for these cases",
+            value=False,
+            help=(
+                "Checked: automatic buyer messages use each supplier's real "
+                "email or WhatsApp channel. Unchecked: all outbound messages "
+                "stay in the Streamlit chat for simulation."
+            ),
+        )
+
+        notify_buyer_on_human_review = st.checkbox(
+            "Email the buyer when human review is required",
+            value=False,
+            help=(
+                "When checked, each newly created human-review item sends "
+                "one internal notification email. The recipient is "
+                "BUYER_REVIEW_NOTIFICATION_EMAIL, or BUYER_EMAIL as fallback."
+            ),
+        )
+
+        pending_items = []
+
+        for index, item in enumerate(detection.items):
+            st.markdown(f"### {item.display_name}")
+            st.caption(f"From file: {item.description}")
+
+            item_suppliers = list_suppliers_for_material(item.goods_name)
+            if not item_suppliers:
+                st.warning(
+                    f"No active suppliers are linked to {item.display_name}; "
+                    "this item will be skipped."
+                )
+                continue
+
+            item_supplier_labels = {
+                (
+                    f"{supplier['name']} | "
+                    f"{supplier.get('contact_channel') or 'manual'} | "
+                    f"{supplier.get('email') or supplier.get('whatsapp_number') or 'no contact'}"
+                ): supplier["id"]
+                for supplier in item_suppliers
+            }
+
+            item_quantity = st.number_input(
+                f"Quantity — {item.display_name}",
+                min_value=0.01,
+                value=float(item.quantity) if item.quantity else 1.0,
+                step=1.0,
+                key=f"rfq_item_quantity_{index}",
+            )
+
+            selected_item_supplier_labels = st.multiselect(
+                f"Suppliers — {item.display_name}",
+                options=list(item_supplier_labels.keys()),
+                default=list(item_supplier_labels.keys()),
+                key=f"rfq_item_suppliers_{index}",
+            )
+
+            pending_items.append(
+                {
+                    "item_material": item.display_name,
+                    "quantity": item_quantity,
+                    "supplier_ids": [
+                        item_supplier_labels[label]
+                        for label in selected_item_supplier_labels
+                    ],
+                }
+            )
+
+        pending_supplier_count = len(
+            {
+                supplier_id
+                for item in pending_items
+                for supplier_id in item["supplier_ids"]
+            }
+        )
+
+        submitted = st.form_submit_button(
+            f"Create order ({len(pending_items)} item(s), "
+            f"{pending_supplier_count} supplier(s))",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if not submitted:
+        return
+
+    if not pending_items:
+        st.error("No item has an available supplier; cannot create any case.")
+        return
+
+    items_missing_suppliers = [
+        item["item_material"] for item in pending_items if not item["supplier_ids"]
+    ]
+    if items_missing_suppliers:
+        st.error(
+            "Select at least one supplier for: "
+            + ", ".join(items_missing_suppliers)
+        )
+        return
+
+    try:
+        case_id = create_case_from_detected_items(
+            items=pending_items,
+            notes=notes,
+            auto_send_messages=auto_send_messages,
+            notify_buyer_on_human_review=notify_buyer_on_human_review,
+        )
+
+        attachment_errors = _attach_uploaded_files_to_cases(
+            uploaded_files, [case_id]
+        )
+
+        st.session_state["selected_case_id"] = case_id
+        case_created_message = f"Order created: case ID {case_id}."
+        if attachment_errors:
+            case_created_message += (
+                " Some attachments failed to save: "
+                + "; ".join(attachment_errors)
+            )
+        st.session_state["case_created_message"] = case_created_message
+        st.rerun()
+
+    except Exception as exc:
+        st.error(str(exc))
+
+
+def _render_manual_case_creation(uploaded_files) -> None:
+    """Legacy path: buyer picks one material and its suppliers by hand.
+
+    Used whenever no uploaded file was recognized as an RFQ (or no file was
+    uploaded at all) - behavior here is unchanged from before RFQ
+    auto-detection was added.
+    """
     material_choices = list_material_choices()
 
     if not material_choices:
@@ -206,14 +431,284 @@ def show_create_case_dialog() -> None:
             notify_buyer_on_human_review=notify_buyer_on_human_review,
         )
 
+        attachment_errors = _attach_uploaded_files_to_cases(uploaded_files, [case_id])
+
         st.session_state["selected_case_id"] = case_id
-        st.session_state["case_created_message"] = (
-            f"Case created successfully: ID {case_id}."
-        )
+        case_created_message = f"Case created successfully: ID {case_id}."
+        if attachment_errors:
+            case_created_message += (
+                " Some attachments failed to save: "
+                + "; ".join(attachment_errors)
+            )
+        st.session_state["case_created_message"] = case_created_message
         st.rerun()
 
     except Exception as exc:
         st.error(str(exc))
+
+
+# ---------------------------------------------------------------------
+# Item/supplier comparison for an order-case (multiple case_items)
+# ---------------------------------------------------------------------
+
+def _build_item_supplier_price_matrix(
+    item_rows: list[dict], price_key: str
+) -> pd.DataFrame:
+    """Pivot the per-item supplier rows from build_item_supplier_overview
+    into one case-wide table: one row per item (subcase), one column per
+    supplier, so all items can be scanned side by side instead of opening
+    a separate table per item."""
+    supplier_names: list[str] = []
+    seen_suppliers: set[str] = set()
+
+    for item in item_rows:
+        for s in item.get("suppliers", []):
+            if s["supplier"] not in seen_suppliers:
+                seen_suppliers.add(s["supplier"])
+                supplier_names.append(s["supplier"])
+
+    index = []
+    data = []
+
+    for item in item_rows:
+        index.append(f"{item['item_material']} (qty {item['quantity']})")
+        prices_by_supplier = {
+            s["supplier"]: s[price_key] for s in item.get("suppliers", [])
+        }
+        data.append(
+            [prices_by_supplier.get(name) for name in supplier_names]
+        )
+
+    return pd.DataFrame(data, index=index, columns=supplier_names)
+
+
+def _render_case_wide_price_tables(item_rows: list[dict]) -> None:
+    """Two case-wide summary tables (confirmed / provisional prices),
+    each with one row per item and one column per supplier - a quick,
+    side-by-side comparison instead of one table per item."""
+
+    def _show(title: str, price_key: str) -> None:
+        st.markdown(f"**{title}**")
+        matrix = _build_item_supplier_price_matrix(item_rows, price_key)
+
+        if matrix.empty:
+            st.info("No suppliers linked to any item in this case.")
+            return
+
+        styled = matrix.style.format(
+            lambda v: "" if pd.isna(v) else f"{v:.2f}"
+        ).highlight_min(axis=1, color="#c6efce")
+
+        st.dataframe(styled, use_container_width=True)
+
+    _show("Confirmed prices (USD)", "best_unit_price_usd")
+    _show("Provisional prices (USD)", "provisional_unit_price_usd")
+
+
+def _render_item_supplier_comparison(case_id: int) -> None:
+    """One block per order item, comparing the suppliers linked to that
+    specific item and letting the buyer notify a winner per item - so
+    different items in the same order can go to different suppliers."""
+    st.markdown("### Items in this order — supplier comparison")
+    st.caption(
+        "Each item is compared across the suppliers linked to it. "
+        "Different items can be awarded to different suppliers."
+    )
+
+    item_rows = build_item_supplier_overview(case_id)
+
+    if not item_rows:
+        st.info("No items found for this case.")
+        return
+
+    _render_case_wide_price_tables(item_rows)
+
+    st.markdown("#### Item details and winner notification")
+
+    for item in item_rows:
+        case_item_id = item["case_item_id"]
+        winner = item.get("winner")
+        supplier_rows = item.get("suppliers", [])
+
+        header = f"{item['item_material']} (qty {item['quantity']})"
+        if winner:
+            header += (
+                f" — Winner: {winner['supplier_name']} "
+                f"(USD {winner['unit_price_usd']})"
+            )
+
+        with st.expander(header, expanded=(winner is None)):
+            if not supplier_rows:
+                st.info("No suppliers linked to this item.")
+                continue
+
+            if winner:
+                st.success(
+                    f"Winner: {winner['supplier_name']} at "
+                    f"USD {winner['unit_price_usd']}."
+                )
+                continue
+
+            best_price = min(
+                (
+                    s["best_unit_price_usd"]
+                    for s in supplier_rows
+                    if s["best_unit_price_usd"] is not None
+                ),
+                default=None,
+            )
+
+            for s in supplier_rows:
+                has_offer = s["best_unit_price_usd"] is not None
+                is_best = (
+                    has_offer and s["best_unit_price_usd"] == best_price
+                )
+
+                col1, col2 = st.columns([3, 2])
+
+                with col1:
+                    prefix = "Best price: " if is_best else ""
+                    st.write(f"**{prefix}{s['supplier']}**")
+                    if has_offer:
+                        st.caption(f"Confirmed: USD {s['best_unit_price_usd']}")
+                    elif s.get("provisional_unit_price_usd") is not None:
+                        st.caption(
+                            f"Provisional: USD "
+                            f"{s['provisional_unit_price_usd']}"
+                        )
+                    else:
+                        st.caption("No price yet")
+
+                with col2:
+                    if st.button(
+                        f"Notify {s['supplier']}",
+                        key=(
+                            f"notify_item_winner_{case_item_id}_"
+                            f"{s['supplier_id']}"
+                        ),
+                        disabled=not has_offer,
+                    ):
+                        try:
+                            result = (
+                                generate_and_send_winner_notification_for_case_item(
+                                    case_id=case_id,
+                                    case_item_id=case_item_id,
+                                    supplier_id=int(s["supplier_id"]),
+                                )
+                            )
+
+                            send_result = result.get("send_result")
+                            outcome = (
+                                send_result.get("delivery_outcome")
+                                if send_result is not None
+                                else None
+                            )
+                            winner_name = result["winner_supplier"]["name"]
+
+                            if send_result is None or outcome in (
+                                "sent",
+                                "dry_run",
+                            ):
+                                st.success(
+                                    f"Winner notification sent to "
+                                    f"{winner_name} for "
+                                    f"{result['item_material']}."
+                                )
+                            elif outcome == "transient":
+                                st.warning(
+                                    f"Winner notification for {winner_name} "
+                                    "is queued and will retry automatically."
+                                )
+                            elif outcome == "permanent":
+                                st.error(
+                                    f"Winner notification for {winner_name} "
+                                    "could not be delivered: "
+                                    f"{send_result.get('error') or 'permanent failure'}."
+                                )
+                            elif outcome == "unknown":
+                                st.warning(
+                                    "Delivery status is unknown for "
+                                    f"{winner_name}'s notification after a "
+                                    "timeout or connection loss."
+                                )
+                            else:
+                                st.error(
+                                    send_result.get("error")
+                                    or "Message sending failed."
+                                )
+
+                            st.rerun()
+
+                        except Exception as exc:
+                            st.error(str(exc))
+
+
+def _render_supplier_rollup_overview(case_id: int) -> None:
+    """Read-only per-supplier rollup across every item they're linked to
+    in this order - a quick scan; winner decisions happen in the per-item
+    section above, not here."""
+    st.markdown("### Supplier overview")
+    st.caption(
+        "Each supplier's prices across every item they're linked to in "
+        "this order. Use the per-item sections above to notify a winner."
+    )
+
+    rollup_rows = build_supplier_rollup_overview(case_id)
+
+    if not rollup_rows:
+        st.info("No suppliers found for this case.")
+        return
+
+    supplier_states = {
+        int(row["supplier_id"]): row
+        for row in repo.list_supplier_states_for_case(case_id)
+    }
+
+    for row in rollup_rows:
+        state = supplier_states.get(row["supplier_id"], {}).get(
+            "state", "NOT_CONTACTED"
+        )
+        item_lines = ", ".join(
+            f"{item['item_material']}: "
+            + (
+                f"USD {item['unit_price_usd']}"
+                if item["unit_price_usd"] is not None
+                else "no price yet"
+            )
+            for item in row["items"]
+        )
+        st.markdown(f"**{row['supplier']}** ({state})")
+        st.caption(item_lines or "No items linked.")
+
+
+@st.dialog("Create new negotiation case", width="large")
+def show_create_case_dialog() -> None:
+    """Render case creation only when the buyer explicitly opens it."""
+    uploaded_files = st.file_uploader(
+        "Upload an RFQ file (optional)",
+        type=["xlsx", "csv", "pdf", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        help=(
+            "Upload a natural-stone or brilliant RFQ spreadsheet and its "
+            "item(s) and relevant suppliers are selected automatically, one "
+            "case per item. Other files are stored as reference "
+            "attachments on the case(s) created below."
+        ),
+    )
+
+    detection = _merge_rfq_detection(uploaded_files)
+
+    if detection.recognized and detection.items:
+        _render_detected_rfq_case_creation(detection, uploaded_files)
+        return
+
+    if uploaded_files and not detection.recognized:
+        st.caption(
+            "No recognized RFQ structure was found in the uploaded "
+            "file(s); select the item and suppliers manually below."
+        )
+
+    _render_manual_case_creation(uploaded_files)
 
 
 header_col, create_case_col = st.columns([5, 1])
@@ -406,6 +901,130 @@ with main_col:
         f"Status: {case_data['status']}"
     )
 
+    case_items = case_details.get("items") or []
+    if case_items:
+        with st.expander(
+            f"Items in this order ({len(case_items)})",
+            expanded=False,
+        ):
+            st.caption(
+                "Each item is negotiated independently across the "
+                "supplier(s) linked to it - different items can end up "
+                "awarded to different suppliers."
+            )
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Item": row["item_material"],
+                            "Quantity": row["quantity"],
+                            "Suppliers": ", ".join(
+                                supplier["name"]
+                                for supplier in row.get("suppliers", [])
+                            ),
+                            "From file": row.get("source_description") or "",
+                        }
+                        for row in case_items
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    case_attachments = list_case_attachments(selected_case_id)
+
+    attachment_supplier_labels = {
+        f"{s['name']} | {s['supplier_code']}": s for s in case_suppliers
+    }
+
+    with st.expander(
+        f"Attachments ({len(case_attachments)})",
+        expanded=False,
+    ):
+        if not case_attachments:
+            st.caption("No attachments for this case yet.")
+
+        for attachment in case_attachments:
+            size_kb = attachment["size_bytes"] / 1024
+            st.markdown(
+                f"**{attachment['original_filename']}** "
+                f"— {size_kb:.1f} KB — "
+                f"{attachment['channel']}/{attachment['direction']} — "
+                f"uploaded {attachment['created_at']}"
+            )
+
+            link_col, target_col, send_col = st.columns([2, 3, 2])
+
+            with link_col:
+                try:
+                    attachment_bytes = Path(attachment["stored_path"]).read_bytes()
+                except OSError:
+                    attachment_bytes = None
+
+                if attachment_bytes is not None:
+                    st.download_button(
+                        "Open / download",
+                        data=attachment_bytes,
+                        file_name=attachment["original_filename"],
+                        mime=attachment.get("mime_type") or "application/octet-stream",
+                        key=f"download_case_attachment_{attachment['id']}",
+                    )
+                else:
+                    st.caption("File missing on disk.")
+
+            if attachment_supplier_labels:
+                with target_col:
+                    send_target_label = st.selectbox(
+                        "Send to",
+                        options=list(attachment_supplier_labels.keys()),
+                        key=f"attachment_send_target_{attachment['id']}",
+                        label_visibility="collapsed",
+                    )
+
+                with send_col:
+                    if st.button(
+                        "Send",
+                        key=f"send_case_attachment_{attachment['id']}",
+                    ):
+                        try:
+                            target_supplier = attachment_supplier_labels[
+                                send_target_label
+                            ]
+                            send_case_attachment(
+                                case_id=selected_case_id,
+                                supplier_id=int(target_supplier["id"]),
+                                attachment_id=int(attachment["id"]),
+                            )
+                            st.success(
+                                f"Sent {attachment['original_filename']} to "
+                                f"{target_supplier['name']}."
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+
+            st.markdown("---")
+
+        new_case_attachment_files = st.file_uploader(
+            "Upload a new attachment for this case",
+            accept_multiple_files=True,
+            key=f"new_case_attachment_{selected_case_id}",
+        )
+
+        if new_case_attachment_files and st.button(
+            "Save uploaded file(s) to this case",
+            key=f"save_new_case_attachment_{selected_case_id}",
+        ):
+            attachment_errors = _attach_uploaded_files_to_cases(
+                new_case_attachment_files, [selected_case_id]
+            )
+            if attachment_errors:
+                st.error("; ".join(attachment_errors))
+            else:
+                st.success(
+                    f"Saved {len(new_case_attachment_files)} file(s) to this case."
+                )
+            st.rerun()
 
     open_review_items = repo.list_open_human_review_items_for_case(selected_case_id)
 
@@ -648,6 +1267,31 @@ with main_col:
 
                     st.markdown(msg["body"])
 
+                    for attachment in repo.list_attachments_for_message(
+                        int(msg["id"])
+                    ):
+                        try:
+                            attachment_bytes = Path(
+                                attachment["stored_path"]
+                            ).read_bytes()
+                        except OSError:
+                            st.caption(
+                                f"📎 {attachment['original_filename']} "
+                                "(file missing on disk)"
+                            )
+                            continue
+
+                        st.download_button(
+                            f"📎 {attachment['original_filename']}",
+                            data=attachment_bytes,
+                            file_name=attachment["original_filename"],
+                            mime=(
+                                attachment.get("mime_type")
+                                or "application/octet-stream"
+                            ),
+                            key=f"download_message_attachment_{attachment['id']}",
+                        )
+
         show_manual_buyer_message = st.checkbox(
             "Write manual buyer message",
             value=False,
@@ -722,14 +1366,57 @@ with main_col:
             key=f"supplier_response_body_{selected_case_id}_{supplier_id}",
         )
 
+        supplier_reply_file = st.file_uploader(
+            "Or upload the supplier's price file instead (CSV/XLSX)",
+            type=["csv", "xlsx", "xlsm"],
+            key=f"supplier_reply_file_{selected_case_id}_{supplier_id}",
+            help=(
+                "Simulates a supplier reply that came as a filled-in price "
+                "file rather than typed text. Its contents are read as text "
+                "and interpreted the same way as a typed reply."
+            ),
+        )
+
         if st.button("Record supplier response and continue negotiation"):
             try:
+                display_body = supplier_body.strip()
+                analysis_text = None
+
+                if supplier_reply_file is not None:
+                    extracted_text = extract_text_from_spreadsheet(
+                        supplier_reply_file.getvalue(),
+                        supplier_reply_file.name,
+                    )
+                    analysis_text = (
+                        f"{display_body}\n\n{extracted_text}"
+                        if display_body
+                        else extracted_text
+                    )
+                    if not display_body:
+                        display_body = (
+                            "(Replied with an attached file: "
+                            f"{supplier_reply_file.name})"
+                        )
+
                 result = record_supplier_message_simple(
                     case_id=selected_case_id,
                     supplier_id=supplier_id,
                     channel="manual",
-                    body=supplier_body,
+                    body=display_body,
+                    analysis_text=analysis_text,
                 )
+
+                if supplier_reply_file is not None:
+                    save_case_attachment(
+                        case_id=selected_case_id,
+                        original_filename=supplier_reply_file.name,
+                        file_bytes=supplier_reply_file.getvalue(),
+                        supplier_id=supplier_id,
+                        message_id=result["inbound_message_id"],
+                        channel="manual",
+                        direction="inbound",
+                    )
+
                 negotiation_result = continue_negotiation_for_case(
                     case_id=selected_case_id,
                 )
@@ -737,23 +1424,42 @@ with main_col:
                 extraction = result["extraction"]
 
                 if result["saved_offer_id"]:
-                    offer_status = extraction.get("offer_status", "confirmed")
+                    item_offers = extraction.get("item_offers")
 
-                    if offer_status == "provisional":
-                        st.info(
-                            f"Supplier response recorded. Provisional price "
-                            f"stored: USD {extraction['unit_price_usd']}. "
-                            "It is excluded from comparison until confirmed. "
-                            f"Created {len(negotiation_result['actions'])} "
+                    if item_offers:
+                        item_summary = ", ".join(
+                            f"{item['item_material']}: USD "
+                            f"{item['unit_price_usd']} ({item['status']})"
+                            for item in item_offers
+                        )
+                        st.success(
+                            f"Supplier response recorded. Price(s) saved "
+                            f"for: {item_summary}. Created "
+                            f"{len(negotiation_result['actions'])} "
                             "automatic message(s)."
                         )
                     else:
-                        st.success(
-                            f"Supplier response recorded. Confirmed offer "
-                            f"saved: USD {extraction['unit_price_usd']}. "
-                            f"Created {len(negotiation_result['actions'])} "
-                            "automatic message(s)."
+                        offer_status = extraction.get(
+                            "offer_status", "confirmed"
                         )
+
+                        if offer_status == "provisional":
+                            st.info(
+                                f"Supplier response recorded. Provisional "
+                                f"price stored: USD "
+                                f"{extraction['unit_price_usd']}. It is "
+                                "excluded from comparison until confirmed. "
+                                f"Created {len(negotiation_result['actions'])} "
+                                "automatic message(s)."
+                            )
+                        else:
+                            st.success(
+                                f"Supplier response recorded. Confirmed "
+                                f"offer saved: USD "
+                                f"{extraction['unit_price_usd']}. Created "
+                                f"{len(negotiation_result['actions'])} "
+                                "automatic message(s)."
+                            )
                 else:
                     st.info(
                         "Supplier response recorded. "
@@ -770,6 +1476,11 @@ with main_col:
     # -----------------------------------------------------------------
     # Supplier overview and winner notification
     # -----------------------------------------------------------------
+
+    if case_items:
+        _render_item_supplier_comparison(selected_case_id)
+        _render_supplier_rollup_overview(selected_case_id)
+        st.stop()
 
     st.markdown("### Supplier overview")
 

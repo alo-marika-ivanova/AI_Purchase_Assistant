@@ -9,3 +9,4 @@ __pycache__/
 venv/
 .idea/
 .streamlit/secrets.toml
+data/attachments/

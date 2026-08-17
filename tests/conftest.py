@@ -21,6 +21,8 @@ os.environ["USE_LLM_COMMUNICATION_WRITER"] = "false"
 import app.db.database as database_module
 from app.db.database import get_connection, initialize_database
 
+import app.services.attachment_service as attachment_service_module
+
 
 def _insert_test_suppliers() -> dict[str, int]:
     conn = get_connection()
@@ -90,3 +92,19 @@ def isolated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def supplier_ids() -> dict[str, int]:
     return _insert_test_suppliers()
+
+
+@pytest.fixture(autouse=True)
+def isolated_attachment_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Redirect attachment storage to a per-test temp directory.
+
+    Mirrors isolated_database above: without this, tests would write real
+    files under the repo's ATTACHMENT_STORAGE_DIR default.
+    """
+    storage_dir = tmp_path / "attachments"
+    monkeypatch.setattr(
+        attachment_service_module, "ATTACHMENT_STORAGE_DIR", storage_dir
+    )
+    yield

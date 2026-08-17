@@ -7,7 +7,16 @@ from dotenv import load_dotenv
 
 from app.db.repository import PurchasingRepository
 from app.integrations.graph_email_adapter import list_recent_inbox_messages
-from app.services.simple_chat_service import record_supplier_message_simple
+from app.services.attachment_service import (
+    extract_text_from_spreadsheet,
+    save_case_attachment,
+)
+from app.services.simple_chat_service import (
+    _extract_supplier_authored_text,
+    record_supplier_message_simple,
+)
+
+_SPREADSHEET_EXTENSIONS = (".csv", ".xlsx", ".xlsm")
 
 load_dotenv()
 
@@ -40,6 +49,87 @@ def _system_sender_emails() -> set[str]:
         for value in values
         if _normalize_email(value)
     }
+
+
+def _build_display_body_and_analysis_text(
+    body: str, attachments: list[dict]
+) -> tuple[str, str | None, list[str]]:
+    """Fold any spreadsheet attachment(s) into analysis_text, mirroring the
+    Streamlit "simulate a supplier reply" upload path exactly (see
+    ui/streamlit_app_clean.py) so a real inbound email with a filled-in
+    price file is interpreted the same way as a manually simulated one.
+
+    A non-spreadsheet attachment (e.g. a PDF or image) is not readable as
+    text here and is left out of analysis_text - it is still saved via
+    save_case_attachment by the caller so it's visible/downloadable, just
+    not fed to the price-extraction pipeline.
+
+    A spreadsheet-named attachment that fails to parse (e.g. a legacy .xls
+    saved with an .xlsx extension, or a genuinely corrupted file), or one
+    that parses without error but yields no readable cell content at all
+    (e.g. an openpyxl data_only=True read of a file whose cached formula
+    values weren't preserved), is reported back in the third return value
+    - either failure mode must be logged by the caller, not be silently
+    indistinguishable from "no spreadsheet was attached at all".
+    """
+    display_body = (body or "").strip()
+
+    # A real reply's body often carries the buyer's own quoted original
+    # message below the supplier's actual text (most mail clients insert
+    # this automatically on reply). record_supplier_message_simple strips
+    # that out of whatever text it's given via _extract_supplier_authored_text
+    # before classification - but analysis_text puts the extracted
+    # spreadsheet content AFTER the body, so if that stripping ran on the
+    # combined string, it would cut off everything from the quote marker
+    # onward, discarding the real price data along with the quoted history.
+    # Stripping it here, before concatenating, means there is no marker
+    # left for that later pass to find - the price data survives intact.
+    authored_body = _extract_supplier_authored_text(display_body)
+
+    extracted_blocks = []
+    extraction_issues = []
+    for attachment in attachments:
+        filename = attachment.get("filename") or ""
+        if not filename.lower().endswith(_SPREADSHEET_EXTENSIONS):
+            continue
+        try:
+            extracted = extract_text_from_spreadsheet(
+                attachment["content_bytes"], filename
+            )
+        except Exception as exc:
+            # A malformed/unreadable spreadsheet must not block importing
+            # the email itself - it's still saved for the buyer to inspect
+            # manually, just without automatic price extraction.
+            extraction_issues.append(
+                f"{filename}: failed to parse ({exc})"
+            )
+            continue
+
+        if not extracted.strip():
+            extraction_issues.append(
+                f"{filename}: parsed with no error but produced no "
+                "readable cell content"
+            )
+            continue
+
+        extracted_blocks.append(extracted)
+
+    if not extracted_blocks:
+        return display_body, None, extraction_issues
+
+    extracted_text = "\n\n".join(extracted_blocks)
+    analysis_text = (
+        f"{authored_body}\n\n{extracted_text}" if authored_body else extracted_text
+    )
+
+    if not display_body:
+        attachment_names = ", ".join(
+            attachment.get("filename") or "attachment"
+            for attachment in attachments
+        )
+        display_body = f"(Replied with an attached file: {attachment_names})"
+
+    return display_body, analysis_text, extraction_issues
 
 
 def build_case_email_subject(
@@ -119,6 +209,10 @@ def import_supplier_emails_for_case(case_id: int, top: int = 25) -> dict:
         sender_email = email.get("sender_email") or ""
         sender_email_normalized = _normalize_email(sender_email)
         body = email.get("body") or ""
+        attachments = email.get("attachments") or []
+        display_body, analysis_text, extraction_issues = (
+            _build_display_body_and_analysis_text(body, attachments)
+        )
 
         basic_result = {
             "subject": subject,
@@ -215,7 +309,7 @@ def import_supplier_emails_for_case(case_id: int, top: int = 25) -> dict:
             )
             continue
 
-        if not body.strip():
+        if not display_body.strip():
             skipped_count += 1
             results.append(
                 {
@@ -227,11 +321,23 @@ def import_supplier_emails_for_case(case_id: int, top: int = 25) -> dict:
             )
             continue
 
+        if extraction_issues:
+            repo.log_worker_event(
+                case_id=case_id,
+                event_type="attachment_extraction_failed",
+                details=(
+                    "Could not read price data from attachment(s): "
+                    f"{'; '.join(extraction_issues)}. The file was saved "
+                    "for manual review, but automatic price extraction used "
+                    "only the email's typed text."
+                ),
+            )
+
         if repo.inbound_message_duplicate_exists(
             case_id=case_id,
             supplier_id=int(supplier["id"]),
             channel="email",
-            body=body,
+            body=display_body,
         ):
             skipped_count += 1
             results.append(
@@ -248,9 +354,21 @@ def import_supplier_emails_for_case(case_id: int, top: int = 25) -> dict:
             case_id=case_id,
             supplier_id=int(supplier["id"]),
             channel="email",
-            body=body,
+            body=display_body,
+            analysis_text=analysis_text,
         )
         inbound_message_id = int(result["inbound_message_id"])
+
+        for attachment in attachments:
+            save_case_attachment(
+                case_id=case_id,
+                original_filename=attachment.get("filename") or "attachment",
+                file_bytes=attachment["content_bytes"],
+                supplier_id=int(supplier["id"]),
+                message_id=inbound_message_id,
+                channel="email",
+                direction="inbound",
+            )
 
         internet_message_id = (
                 email.get("internet_message_id")
@@ -293,17 +411,6 @@ def import_supplier_emails_for_case(case_id: int, top: int = 25) -> dict:
             sender_email=sender_email,
             subject=subject,
             received_at=email.get("received_at"),
-        )
-
-        repo.record_email_message_header(
-            message_id=int(result["inbound_message_id"]),
-            case_id=case_id,
-            supplier_id=int(supplier["id"]),
-            subject=subject,
-            internet_message_id=email.get("internet_message_id"),
-            in_reply_to=None,
-            reference_chain=email.get("internet_message_id"),
-            graph_conversation_id=email.get("graph_conversation_id"),
         )
 
         imported_count += 1

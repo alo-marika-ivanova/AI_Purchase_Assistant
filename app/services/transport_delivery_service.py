@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import random
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from app.db.repository import PurchasingRepository
 from app.integrations.email_adapter import send_email_message
@@ -223,12 +224,33 @@ def deliver_claimed_email_job(
     supplier_id = job.get("supplier_id")
     supplier_id = int(supplier_id) if supplier_id is not None else None
 
+    # Read from disk at send time (not passed in by the caller) so a later
+    # retry of this same job - possibly after a worker restart - still picks
+    # up any attachment linked to the message before the first attempt.
+    attachments = None
+    attachment_rows = repo.list_attachments_for_message(message_id)
+    if attachment_rows:
+        attachments = []
+        for row in attachment_rows:
+            try:
+                content = Path(row["stored_path"]).read_bytes()
+            except OSError:
+                continue
+            attachments.append(
+                {
+                    "filename": row["original_filename"],
+                    "content": content,
+                    "mime_type": row.get("mime_type"),
+                }
+            )
+
     result = send_email_message(
         to_email=to_email,
         subject=subject,
         body=body,
         in_reply_to=in_reply_to,
         references=references,
+        attachments=attachments,
     )
 
     _record_outcome(

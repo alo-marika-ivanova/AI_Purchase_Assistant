@@ -16,6 +16,7 @@ def add_offer(
     extraction_confidence: str = "human_verified",
     notes: str | None = None,
     status: str = "active",
+    case_item_id: int | None = None,
 ) -> int:
     if unit_price_usd <= 0:
         raise ValueError("Unit price must be greater than zero.")
@@ -32,6 +33,7 @@ def add_offer(
         extraction_confidence=extraction_confidence,
         notes=notes,
         status=status,
+        case_item_id=case_item_id,
     )
 
 

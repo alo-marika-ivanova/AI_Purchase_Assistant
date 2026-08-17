@@ -47,3 +47,30 @@ def test_claude_provider_requires_api_key(
 
     with pytest.raises(RuntimeError):
         get_llm_provider()
+
+
+def test_claude_provider_default_max_tokens_is_large_enough_for_multi_item_replies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-item order reply's JSON response carries one item_offers
+    entry per item on top of the usual fields; 1024 tokens was enough for a
+    single-item reply but silently truncated a several-item order's
+    response mid-JSON, which then failed to parse and was reported as an
+    unclassifiable message with no price extracted at all."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.delenv("ANTHROPIC_MAX_TOKENS", raising=False)
+
+    provider = ClaudeProvider()
+
+    assert provider.max_tokens >= 4096
+
+
+def test_claude_provider_max_tokens_still_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("ANTHROPIC_MAX_TOKENS", "2048")
+
+    provider = ClaudeProvider()
+
+    assert provider.max_tokens == 2048

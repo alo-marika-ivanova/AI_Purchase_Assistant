@@ -188,10 +188,23 @@ def decide_common_negotiation_reply(
         analysis.get("recommended_action") or ""
     ).strip().upper()
 
+    category = str(analysis.get("message_category") or "").strip().upper()
+
+    # A multi-item order's reply carries its price(s) in item_offers, not
+    # the single top-level unit_price_usd - that field is correctly left
+    # empty for such a message and must not be mistaken for "no usable
+    # price". Likewise, a target acceptance ("yes, agreed") is usable on
+    # its own regardless of whether the number was restated - the caller
+    # resolves the actual price (the stored target, per item for a
+    # multi-item order) without needing it repeated here.
+    has_item_offers = bool(analysis.get("item_offers"))
+
     needs_price_but_missing = (
         classifier_action
         in {"SAVE_OFFER", "SAVE_PROVISIONAL_OFFER_AND_WAIT"}
         and analysis.get("unit_price_usd") is None
+        and not has_item_offers
+        and category != "TARGET_ACCEPTANCE"
     )
 
     if llm_succeeded and not needs_price_but_missing:

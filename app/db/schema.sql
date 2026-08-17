@@ -13,6 +13,17 @@ CREATE TABLE IF NOT EXISTS suppliers (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- One row per uploaded RFQ file that resolved to more than one item (one
+-- case per item; see rfq_detection_service.py). Lets sibling cases from the
+-- same upload be grouped and compared as one order, without changing how
+-- negotiation itself works - each case still negotiates independently.
+CREATE TABLE IF NOT EXISTS rfq_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_description TEXT NOT NULL,
+    file_type TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS negotiation_cases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     case_number TEXT NOT NULL UNIQUE,
@@ -22,7 +33,9 @@ CREATE TABLE IF NOT EXISTS negotiation_cases (
     status TEXT NOT NULL DEFAULT 'DRAFT',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    auto_send_messages INTEGER NOT NULL DEFAULT 0
+    auto_send_messages INTEGER NOT NULL DEFAULT 0,
+    batch_id INTEGER,
+    FOREIGN KEY(batch_id) REFERENCES rfq_batches(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS case_suppliers (
@@ -84,9 +97,14 @@ CREATE TABLE IF NOT EXISTS action_logs (
     FOREIGN KEY(case_id) REFERENCES negotiation_cases(id) ON DELETE SET NULL
 );
 
+-- case_item_id is NULL for a legacy single-item case's offers (the case
+-- itself is the one thing being priced). For an order-case, it identifies
+-- which specific item (case_items row) this offer is for, since one
+-- supplier reply can price several of the order's items independently.
 CREATE TABLE IF NOT EXISTS offers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     case_id INTEGER NOT NULL,
+    case_item_id INTEGER,
     supplier_id INTEGER NOT NULL,
     message_id INTEGER,
 
@@ -102,13 +120,24 @@ CREATE TABLE IF NOT EXISTS offers (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     FOREIGN KEY(case_id) REFERENCES negotiation_cases(id) ON DELETE CASCADE,
+    FOREIGN KEY(case_item_id) REFERENCES case_items(id) ON DELETE CASCADE,
     FOREIGN KEY(supplier_id) REFERENCES suppliers(id) ON DELETE CASCADE,
     FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE SET NULL
 );
 
+-- idx_offers_case_item_id is created in
+-- database.py::_apply_case_item_id_migrations, not here: on a pre-existing
+-- database the column is added by that same migration, and an index
+-- statement running here (before migrations run) would fail against the
+-- old table shape.
+
+-- case_item_id is NULL for a legacy single-item case's one winner. For an
+-- order-case, each item gets its own winner_decisions row, so different
+-- items in the same order can be awarded to different suppliers.
 CREATE TABLE IF NOT EXISTS winner_decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     case_id INTEGER NOT NULL,
+    case_item_id INTEGER,
     supplier_id INTEGER NOT NULL,
     offer_id INTEGER NOT NULL,
 
@@ -119,9 +148,13 @@ CREATE TABLE IF NOT EXISTS winner_decisions (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     FOREIGN KEY(case_id) REFERENCES negotiation_cases(id) ON DELETE CASCADE,
+    FOREIGN KEY(case_item_id) REFERENCES case_items(id) ON DELETE CASCADE,
     FOREIGN KEY(supplier_id) REFERENCES suppliers(id) ON DELETE CASCADE,
     FOREIGN KEY(offer_id) REFERENCES offers(id) ON DELETE CASCADE
 );
+
+-- idx_winner_decisions_case_item_id is likewise created in
+-- database.py::_apply_case_item_id_migrations, for the same reason.
 
 CREATE TABLE IF NOT EXISTS supplier_negotiation_state (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -297,6 +330,42 @@ CREATE TABLE IF NOT EXISTS case_negotiation_context (
         REFERENCES offers(id)
 );
 
+-- Per-item counterpart to case_negotiation_context. An order-case's items
+-- can have genuinely different best offers (e.g. two different stones), so
+-- the single case-wide target above is not meaningful once case_items
+-- exist for a case - this table holds one row per case_item with its own
+-- target, computed the same way (target_discount_percent below that
+-- item's own best offer among suppliers linked to it). Legacy single-item
+-- cases have no case_items rows and never populate this table; their
+-- negotiation continues to use case_negotiation_context unchanged.
+CREATE TABLE IF NOT EXISTS case_item_negotiation_context (
+    case_item_id INTEGER PRIMARY KEY,
+    case_id INTEGER NOT NULL,
+    initial_best_offer_usd REAL NOT NULL,
+    target_price_usd REAL NOT NULL,
+    best_supplier_id INTEGER NOT NULL,
+    best_offer_id INTEGER NOT NULL,
+    valid_offer_count INTEGER NOT NULL,
+    target_discount_percent REAL NOT NULL,
+    ranking_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY(case_item_id)
+        REFERENCES case_items(id)
+        ON DELETE CASCADE,
+
+    FOREIGN KEY(case_id)
+        REFERENCES negotiation_cases(id)
+        ON DELETE CASCADE,
+
+    FOREIGN KEY(best_supplier_id)
+        REFERENCES suppliers(id),
+
+    FOREIGN KEY(best_offer_id)
+        REFERENCES offers(id)
+);
+
 CREATE TABLE IF NOT EXISTS supplier_goods (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     supplier_id INTEGER NOT NULL,
@@ -388,3 +457,77 @@ CREATE TABLE IF NOT EXISTS transport_outbox (
 
 CREATE INDEX IF NOT EXISTS idx_transport_outbox_claim
 ON transport_outbox(status, next_attempt_at);
+
+-- Filesystem-backed case attachments. Binaries live on disk (see
+-- ATTACHMENT_STORAGE_DIR in app/services/attachment_service.py); this table
+-- only stores metadata plus enough to locate and verify the file later.
+-- supplier_id/message_id are nullable because an attachment can be uploaded
+-- by the buyer at case-creation time, before any supplier message exists.
+CREATE TABLE IF NOT EXISTS attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL,
+    supplier_id INTEGER,
+    message_id INTEGER,
+
+    channel TEXT NOT NULL DEFAULT 'manual'
+        CHECK (channel IN ('whatsapp', 'email', 'manual')),
+    direction TEXT NOT NULL DEFAULT 'outbound'
+        CHECK (direction IN ('outbound', 'inbound')),
+
+    original_filename TEXT NOT NULL,
+    stored_path TEXT NOT NULL,
+    mime_type TEXT,
+    size_bytes INTEGER NOT NULL,
+    sha256_hash TEXT NOT NULL,
+
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY(case_id) REFERENCES negotiation_cases(id) ON DELETE CASCADE,
+    FOREIGN KEY(supplier_id) REFERENCES suppliers(id) ON DELETE SET NULL,
+    FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_attachments_case_id
+ON attachments(case_id);
+
+-- One row per item ("subcase") in an order. A case created from an
+-- uploaded RFQ file (see case_service.create_case_from_detected_items) is
+-- the whole order: it keeps a summary item_material label and the union of
+-- every supplier involved, while each row here is one requested item
+-- (stone, or brilliant size/color bucket) with its own quantity. Which
+-- supplier(s) are being asked about which item is recorded separately in
+-- case_item_suppliers, since different suppliers can cover different,
+-- overlapping subsets of the order's items. Legacy single-item cases have
+-- no rows here and are unaffected.
+CREATE TABLE IF NOT EXISTS case_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL,
+    item_material TEXT NOT NULL,
+    quantity REAL,
+    source_description TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(case_id) REFERENCES negotiation_cases(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_case_items_case_id
+ON case_items(case_id);
+
+-- Which supplier(s) are being asked to quote which item within an order.
+-- A supplier linked to several items in the same case still gets exactly
+-- one combined outbound message (see communication_writer.py), listing
+-- only the items in their own case_item_suppliers rows.
+CREATE TABLE IF NOT EXISTS case_item_suppliers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_item_id INTEGER NOT NULL,
+    supplier_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(case_item_id, supplier_id),
+    FOREIGN KEY(case_item_id) REFERENCES case_items(id) ON DELETE CASCADE,
+    FOREIGN KEY(supplier_id) REFERENCES suppliers(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_case_item_suppliers_case_item_id
+ON case_item_suppliers(case_item_id);
+
+CREATE INDEX IF NOT EXISTS idx_case_item_suppliers_supplier_id
+ON case_item_suppliers(supplier_id);
