@@ -1404,7 +1404,14 @@ def record_negotiation_supplier_message(
             "UNKNOWN",
         ),
         reason=(
-            analysis.get("reason")
-            or "The negotiation reply requires human review."
+            (
+                analysis.get("reason")
+                or "The negotiation reply requires human review."
+            )
+            + (
+                f" (LLM error: {analysis['error']})"
+                if analysis.get("error")
+                else ""
+            )
         ),
     )

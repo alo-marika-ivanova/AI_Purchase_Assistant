@@ -680,6 +680,37 @@ def test_repeatedly_malformed_response_still_fails_after_retry_budget(
     assert result["requires_human_review"] is True
 
 
+def test_malformed_response_failure_includes_the_raw_text_for_diagnosis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces a real gap: a classification failure only ever reported
+    a generic parse-error message, with the actual malformed/truncated
+    LLM output discarded - making it impossible to tell whether the
+    response was empty, cut off mid-JSON, or malformed some other way
+    without reproducing it live. The raw response must be included in
+    the failure's error detail."""
+    flaky_provider = _FlakyThenGoodProvider(
+        {"message_category": "CLEAR_PRICE_OFFER"},
+        bad_calls=99,
+    )
+    monkeypatch.setattr(
+        classifier_module, "get_llm_provider", lambda: flaky_provider
+    )
+
+    result = analyze_supplier_message_with_ollama(
+        message_body="garnet pink is for 33 usd peridot is for 22 usd.",
+        case_data=CASE_DATA,
+        supplier={"name": "New Goi Gems SRL"},
+        message_history=[],
+        conversation_stage="RFQ",
+        supplier_state="AWAITING_RESPONSE",
+    )
+
+    assert result["success"] is False
+    assert '{"message_category": "CLEAR_PRICE_OFFER", "unit_pri' in result["error"]
+    assert "Raw LLM response" in result["error"]
+
+
 def test_auth_failure_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     """A provider construction failure (e.g. missing API key) fails the
     same way every time - it must not be retried, only a malformed-JSON

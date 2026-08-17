@@ -976,3 +976,67 @@ def test_legacy_single_item_case_offer_recording_is_unaffected(
 
     offer = repo.get_best_offer_for_case_supplier(case_id, supplier_ids["email"])
     assert offer["unit_price_usd"] == pytest.approx(180.0)
+
+
+def test_classifier_failure_surfaces_the_real_error_in_the_review_reason(
+    supplier_ids: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reproduces a real bug: when the classifier call itself fails (e.g.
+    a malformed/truncated LLM response for a multi-item order, which the
+    provider's own max_tokens setting has caused before), the human
+    review item's reason showed only a generic "could not safely
+    classify" boilerplate - the actual underlying error was silently
+    discarded, making it impossible to diagnose without querying the
+    database and asking someone to reproduce it. The real error must be
+    included in the review reason."""
+    supplier_a = supplier_ids["email"]
+
+    case_id = create_case_from_detected_items(
+        items=[
+            {
+                "item_material": "Garnet Pink",
+                "quantity": 12.0,
+                "supplier_ids": [supplier_a],
+            },
+            {
+                "item_material": "Peridote (PER)",
+                "quantity": 140.0,
+                "supplier_ids": [supplier_a],
+            },
+        ],
+        notes="",
+    )
+
+    simple_chat_service.start_negotiating_case(case_id)
+
+    monkeypatch.setattr(
+        simple_chat_service,
+        "analyze_supplier_message_with_ollama",
+        lambda **_: {
+            "success": False,
+            "message_category": "UNKNOWN",
+            "recommended_action": "PAUSE_FOR_REVIEW",
+            "requires_human_review": True,
+            "contains_risky_topic": True,
+            "risk_category": "UNKNOWN",
+            "confidence": "low",
+            "item_offers": None,
+            "reason": "The LLM could not safely classify the supplier message.",
+            "error": "LLM returned no valid JSON object.",
+        },
+    )
+
+    result = simple_chat_service.record_supplier_message_simple(
+        case_id=case_id,
+        supplier_id=supplier_a,
+        channel="manual",
+        body="garnet pink is for 33 usd peridot is for 22 usd, are you interested?",
+    )
+
+    assert result["review_item_id"] is not None
+
+    review_items = repo.list_open_human_review_items_for_case(case_id)
+    review = next(
+        item for item in review_items if item["id"] == result["review_item_id"]
+    )
+    assert "LLM returned no valid JSON object." in review["reason"]

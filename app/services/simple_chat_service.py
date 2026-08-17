@@ -1463,8 +1463,12 @@ def record_supplier_message_simple(
     return pause_for_review(
         review_type=analysis.get("message_category", "UNKNOWN"),
         reason=(
-            analysis.get("reason")
-            or "The message requires human review."
+            (analysis.get("reason") or "The message requires human review.")
+            + (
+                f" (LLM error: {analysis['error']})"
+                if analysis.get("error")
+                else ""
+            )
         ),
     )
 

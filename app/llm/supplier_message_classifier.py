@@ -958,6 +958,7 @@ Return exactly one JSON object with these keys:
 """
 
     provider = None
+    raw_text: str | None = None
     try:
         provider = get_llm_provider()
 
@@ -1029,8 +1030,18 @@ Return exactly one JSON object with these keys:
             if fallback_category is not None:
                 return build_deterministic_refusal_result(fallback_category)
 
+        error_detail = str(exc)
+        if raw_text:
+            snippet = raw_text.strip()
+            if len(snippet) > 500:
+                snippet = snippet[:500] + "... [truncated]"
+            error_detail = (
+                f"{error_detail} | Raw LLM response "
+                f"({len(raw_text)} chars): {snippet!r}"
+            )
+
         return _failure_result(
-            str(exc),
+            error_detail,
             provider_name=fallback_provider_name,
             model_name=fallback_model_name,
         )
